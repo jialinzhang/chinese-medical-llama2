@@ -321,7 +321,6 @@ def load_tokenizer_and_preprocess_dataset(dataArguments: DataArguments,
 # Step3: 加载数据
 def create_dataloader(tokenizer: LlamaTokenizer,
                       dataArguments: DataArguments,
-                      modelArguments: ModelArguments,
                       trainingArguments: MyTrainingArguments) -> Tuple[DataLoader]:
     
     processed_datasets = datasets.load_from_disk(dataArguments.processed_data_cache_dir)
@@ -343,19 +342,17 @@ def create_dataloader(tokenizer: LlamaTokenizer,
         logger.info(f"Num eval_samples  {len(eval_dataset)}")
         logger.info("evaling example:")
         logger.info(tokenizer.decode(eval_dataset[0]['input_ids']))
-        
-    torch_dtype = getattr(torch, modelArguments.torch_dtype)
     
     def collate_fn(batch: List[Dict]):
-        input_ids, attention_masks, labels = [], [], []
+        batch_input_ids, batch_attention_mask, batch_label = [], [], []
         for item in batch:
-            input_ids.append(item['input_ids'])
-            attention_masks.append(item['attention_mask'])
-            labels.append(item['label'])
-        input_ids = torch.tensor(input_ids, dtype=torch_dtype).cuda(trainingArguments.local_rank)
-        attention_masks = torch.tensor(attention_masks, dtype=torch_dtype).cuda(trainingArguments.local_rank)
-        labels = torch.tensor(labels, dtype=torch_dtype).cuda(trainingArguments.local_rank)
-        return input_ids, attention_masks, labels
+            batch_input_ids.append(item['input_ids'])
+            batch_attention_mask.append(item['attention_mask'])
+            batch_label.append(item['label'])
+        batch_input_ids = torch.tensor(batch_input_ids).cuda(trainingArguments.local_rank)
+        batch_attention_mask = torch.tensor(batch_attention_mask).cuda(trainingArguments.local_rank)
+        batch_label = torch.tensor(batch_label).cuda(trainingArguments.local_rank)
+        return batch_input_ids, batch_attention_mask, batch_label
         
     train_sampler = DistributedSampler(dataset=train_dataset)
     train_dataloader = DataLoader(dataset=train_dataset, 
@@ -443,9 +440,10 @@ class MyTrainer:
             num_batches = len(self.train_dataloader)
             for batch_index, batch in enumerate(self.train_dataloader):
                 cur_step = num_batches*epoch_index + batch_index + 1
-                input_ids, attention_masks, labels = batch
-                outputs = self.model(input_ids=input_ids, attention_mask=attention_masks, labels=labels)
+                batch_input_ids, batch_attention_mask, batch_label = batch
+                outputs = self.model(input_ids=batch_input_ids, attention_mask=batch_attention_mask, labels=batch_label)
                 loss = outputs[0]
+                loss.requires_grad_(True)
                 # 判断是否进行梯度累积，如果进行，则将损失值除以累积步数
                 if self.trainingArguments.gradient_accumulation_steps > 0:
                     loss /= self.trainingArguments.gradient_accumulation_steps
