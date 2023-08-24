@@ -35,11 +35,6 @@ from itertools import chain
 from typing import Optional, Dict, Tuple
 from tqdm import tqdm, trange
 import logging
-logger = logging.getLogger(__name__)
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s - %(message)s", 
-                    datefmt="%Y/%m/%d %H:%M:%S",
-                    level=logging.INFO, 
-                    handlers=[logging.StreamHandler(sys.stdout)])
 
 # Step1: 参数设置和评测指标
 @dataclass
@@ -91,7 +86,7 @@ class DataArguments:
     )
 
     processed_data_cache_dir: Optional[str] = field(
-        default="./", metadata={"help": ("预处理后的数据集存储路径")}
+        default="./processed", metadata={"help": ("预处理后的数据集存储路径")}
     )
 
 
@@ -396,6 +391,7 @@ def load_ddp_fsdp_model(tokenizer: LlamaTokenizer,
 
     # 扩充词嵌入矩阵
     model_vocab_size = model.get_output_embeddings().weight.size(0)
+    # model.resize_token_embeddings: 扩充embedding矩阵大徐爱和lm_head的输出维度大小
     model.resize_token_embeddings(len(tokenizer))
     logger.info(f"Llama raw vocab size is {model_vocab_size}")
     logger.info(f"chinese medical tokenizer vocab size is {len(tokenizer)}")
@@ -576,6 +572,11 @@ if __name__ == '__main__':
     # 参数解析
     parser = HfArgumentParser((ModelArguments, DataArguments, MyTrainingArguments))
     modelArguments, dataArguments, trainingArguments = parser.parse_args_into_dataclasses()
+    logger = logging.getLogger(f'Rank:{trainingArguments.local_rank} {__name__}')
+    logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s - %(message)s", 
+                        datefmt="%Y/%m/%d %H:%M:%S",
+                        level=logging.INFO, 
+                        handlers=[logging.StreamHandler(sys.stdout)])
     # 数据预处理
     tokenizer = load_tokenizer_and_preprocess_dataset(dataArguments, modelArguments, trainingArguments, False, logger)
     # 加载数据
