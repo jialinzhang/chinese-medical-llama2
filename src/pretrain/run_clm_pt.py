@@ -446,7 +446,7 @@ class MyTrainer:
                 loss.requires_grad_(True)
                 # 判断是否进行梯度累积，如果进行，则将损失值除以累积步数
                 if self.trainingArguments.gradient_accumulation_steps > 0:
-                    loss /= self.trainingArguments.gradient_accumulation_steps
+                    loss = loss / self.trainingArguments.gradient_accumulation_steps
                 ema_loss = 0.9 * ema_loss + 0.1 * loss.item()
                 # 计算梯度值,并累加梯度
                 loss.backward()
