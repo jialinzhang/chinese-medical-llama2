@@ -28,7 +28,7 @@ per_device_eval_batch_size=1
 gradient_accumulation_steps=8
 
 
-CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.launch --nproc_per_node 2 --nnodes 1 --node_rank 0 run_clm_pt.py \
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node 2 --nnodes 1 --node_rank 0 run_clm_pt.py \
                                --dataset_dir ${dataset_dir} \
                                --dataset_subset_name ${dataset_subset_name} \
                                --block_size ${block_size} \

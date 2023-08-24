@@ -229,7 +229,8 @@ def load_tokenizer_and_preprocess_dataset(dataArguments: DataArguments,
     # 只加载tokenizer，不进行数据预处理
     if only_load_tokenizer:
         return tokenizer
-    if dataArguments.block_size is None:
+    block_size = dataArguments.block_size
+    if block_size is None:
         block_size = tokenizer.model_max_length
     if block_size > 1024:
         logger.warning(
@@ -247,7 +248,7 @@ def load_tokenizer_and_preprocess_dataset(dataArguments: DataArguments,
         block_size = min(dataArguments.block_size, tokenizer.model_max_length)
     def tokenize_function(examples: datasets.Dataset) -> Dict:
         """ 
-        数据处理函数: 批量对数据集的制定列进行分词：
+        数据处理函数: 批量对数据集的制定列进行分词,并在句首添加<s>符号表示起始符bos
         examples: 
         例如, Dataset({
                         features: ['text',...],
@@ -290,7 +291,7 @@ def load_tokenizer_and_preprocess_dataset(dataArguments: DataArguments,
         elif dataArguments.train_file_path and dataArguments.eval_file_path and dataArguments.data_file_type:
             data_files = {
                 "train": dataArguments.train_file_path,
-                "eval": dataArguments.eval_file_path
+                "validation": dataArguments.eval_file_path
             }
             raw_datasets = load_dataset(dataArguments.data_file_type, data_files=data_files)
         else:
@@ -331,7 +332,7 @@ def create_dataloader(tokenizer: LlamaTokenizer,
     if trainingArguments.do_train:
         train_dataset = processed_datasets['train']
     if trainingArguments.do_eval:
-        eval_dataset = processed_datasets['eval']
+        eval_dataset = processed_datasets['validation']
     if trainingArguments.debug_mode:
         max_train_samples = min(len(train_dataset), dataArguments.max_train_samples)
         train_dataset = train_dataset.select(range(max_train_samples))
