@@ -1,0 +1,14 @@
+llama tokenizer vocab size: 32000
+chinese medical tokenizer vocab size: 30000
+llama tokenizer speical token: ['<s>', '</s>', '<unk>']
+llama tokenizer speical token id: [1, 2, 0]
+llama tokenizer speical token map: {'bos_token': '<s>', 'eos_token': '</s>', 'unk_token': '<unk>'}
+合并前llama tokens num: 32000
+合并后llama tokens num: 60912
+chinese-medical-llama tokenizer has been saved to ../../data/chinese-medical-llama-tokenizer/hf_dir
+chinese-medical-llama tokenizer speical token: ['<s>', '</s>', '<unk>']
+chinese-medical-llama tokenizer speical token id: [1, 2, 0]
+chinese-medical-llama tokenizer speical token map: {'bos_token': '<s>', 'eos_token': '</s>', 'unk_token': '<unk>'}
+Test data: 卵巢肌瘤会有什么症状？卵巢肌瘤是妇科常见病之一
+Tokenized by LlaMA tokenizer: ['▁', '<0xE5>', '<0x8D>', '<0xB5>', '<0xE5>', '<0xB7>', '<0xA2>', '<0xE8>', '<0x82>', '<0x8C>', '<0xE7>', '<0x98>', '<0xA4>', '会', '有', '<0xE4>', '<0xBB>', '<0x80>', '么', '<0xE7>', '<0x97>', '<0x87>', '状', '？', '<0xE5>', '<0x8D>', '<0xB5>', '<0xE5>', '<0xB7>', '<0xA2>', '<0xE8>', '<0x82>', '<0x8C>', '<0xE7>', '<0x98>', '<0xA4>', '是', '<0xE5>', '<0xA6>', '<0x87>', '科', '常', '<0xE8>', '<0xA7>', '<0x81>', '<0xE7>', '<0x97>', '<0x85>', '之', '一']
+Tokenized by chinese-medial-LlaMA tokenizer: ['▁卵巢', '肌瘤', '会有什么症状', '？', '卵巢', '肌瘤', '是妇科', '常见病', '之一']
