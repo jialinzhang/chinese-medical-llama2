@@ -384,8 +384,6 @@ def load_ddp_fsdp_model(tokenizer: LlamaTokenizer,
             config=model_config,
             torch_dtype=torch_dtype
         )
-        model = DDP(module=model.cuda(trainingArguments.local_rank), device_ids=[trainingArguments.local_rank])
-        model = FSDP(module=model, cpu_offload=CPUOffload(offload_params=True))
     else:
         raise ValueError("请配置model_name_or_path")
 
@@ -396,6 +394,10 @@ def load_ddp_fsdp_model(tokenizer: LlamaTokenizer,
     logger.info(f"Llama raw vocab size is {model_vocab_size}")
     logger.info(f"chinese medical tokenizer vocab size is {len(tokenizer)}")
     logger.info("The vocab embedding has been expanded.")
+    
+    # 数据并行
+    model = DDP(module=model.cuda(trainingArguments.local_rank), device_ids=[trainingArguments.local_rank])
+    model = FSDP(module=model, cpu_offload=CPUOffload(offload_params=True))
     
     return model
 
