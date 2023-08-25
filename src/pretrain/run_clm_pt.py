@@ -32,14 +32,9 @@ import os
 import math
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 from tqdm import tqdm, trange
 import logging
-logger = logging.getLogger(__name__)
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s - %(message)s", 
-                    datefmt="%Y/%m/%d %H:%M:%S",
-                    level=logging.INFO, 
-                    handlers=[logging.StreamHandler(sys.stdout)])
 
 # Step1: 参数设置和评测指标
 @dataclass
@@ -91,7 +86,7 @@ class DataArguments:
     )
 
     processed_data_cache_dir: Optional[str] = field(
-        default="./", metadata={"help": ("预处理后的数据集存储路径")}
+        default="./processed", metadata={"help": ("预处理后的数据集存储路径")}
     )
 
 
@@ -168,7 +163,7 @@ class MyTrainingArguments(TrainingArguments):
     6、max_grad_norm: 梯度最大范数,用于梯度裁剪
     7、num_train_epochs: 训练epoch数
     8、max_steps: 最大训练步数,会覆盖掉num_train_epochs
-    9、lr_scheduler_type: 学习率调度策略类型
+    9、lr_scheduler_type: 学习率调度策略类型,可选[linear,cosine,cosine_with_restarts,polynomial,constant,constant_with_warmup,inverse_sqrt]
     10、warmup_ratio: 学习率热身步占总训练步的比率
     11、warmup_steps: 学习率热身步数, 会覆盖warmup_ratio
     12、local_rank: 当前设备的本地编号,是torch.distributed.launch的环境变量
@@ -348,8 +343,16 @@ def create_dataloader(tokenizer: LlamaTokenizer,
         logger.info("evaling example:")
         logger.info(tokenizer.decode(eval_dataset[0]['input_ids']))
     
-    def collate_fn(batch: datasets.Dataset):
-        return None
+    def collate_fn(batch: List[Dict]):
+        batch_input_ids, batch_attention_mask, batch_label = [], [], []
+        for item in batch:
+            batch_input_ids.append(item['input_ids'])
+            batch_attention_mask.append(item['attention_mask'])
+            batch_label.append(item['label'])
+        batch_input_ids = torch.tensor(batch_input_ids).cuda(trainingArguments.local_rank)
+        batch_attention_mask = torch.tensor(batch_attention_mask).cuda(trainingArguments.local_rank)
+        batch_label = torch.tensor(batch_label).cuda(trainingArguments.local_rank)
+        return batch_input_ids, batch_attention_mask, batch_label
         
     train_sampler = DistributedSampler(dataset=train_dataset)
     train_dataloader = DataLoader(dataset=train_dataset, 
@@ -389,17 +392,20 @@ def load_ddp_fsdp_model(tokenizer: LlamaTokenizer,
             config=model_config,
             torch_dtype=torch_dtype
         )
-        model = DDP(module=model.cuda(trainingArguments.local_rank), device_ids=[trainingArguments.local_rank])
-        model = FSDP(module=model, cpu_offload=CPUOffload(offload_params=True))
     else:
         raise ValueError("请配置model_name_or_path")
 
     # 扩充词嵌入矩阵
     model_vocab_size = model.get_output_embeddings().weight.size(0)
+    # model.resize_token_embeddings: 扩充embedding矩阵大徐爱和lm_head的输出维度大小
     model.resize_token_embeddings(len(tokenizer))
     logger.info(f"Llama raw vocab size is {model_vocab_size}")
     logger.info(f"chinese medical tokenizer vocab size is {len(tokenizer)}")
     logger.info("The vocab embedding has been expanded.")
+    
+    # 数据并行
+    model = DDP(module=model.cuda(trainingArguments.local_rank), device_ids=[trainingArguments.local_rank])
+    # model = FSDP(module=model, cpu_offload=CPUOffload(offload_params=True))
     
     return model
 
@@ -428,28 +434,29 @@ class MyTrainer:
         if self.trainingArguments.device == "cuda":
             torch.cuda.empty_cache()
         self.model.train()
-        for epoch_index in trange(self.trainingArguments.num_train_epochs, desc="Epoch", disable=False):
+        for epoch_index in trange(int(self.trainingArguments.num_train_epochs), desc="Epoch", disable=False):
             self.trainSampler.set_epoch(epoch_index)
             ema_loss = 0
             num_batches = len(self.train_dataloader)
             for batch_index, batch in enumerate(self.train_dataloader):
                 cur_step = num_batches*epoch_index + batch_index + 1
-                input_ids = batch['input_ids'].cuda(self.trainingArguments.local_rank)
-                attention_mask = batch['attention_mask'].cuda(self.trainingArguments.local_rank)
-                label = batch['label'].cuda(self.trainingArguments.local_rank)
-                outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=label)
+                batch_input_ids, batch_attention_mask, batch_label = batch
+                outputs = self.model(input_ids=batch_input_ids, attention_mask=batch_attention_mask, labels=batch_label)
                 loss = outputs[0]
+                loss.requires_grad_(True)
                 # 判断是否进行梯度累积，如果进行，则将损失值除以累积步数
                 if self.trainingArguments.gradient_accumulation_steps > 0:
-                    loss /= self.trainingArguments.gradient_accumulation_steps
+                    loss = loss / self.trainingArguments.gradient_accumulation_steps
                 ema_loss = 0.9 * ema_loss + 0.1 * loss.item()
-                # 损失回传计算梯度值,并累加梯度
+                # 计算梯度值,并累加梯度
                 loss.backward()
                 # 梯度裁剪
                 torch.nn.utils.clip_grad_norm([p for n,p in self.train_params], self.trainingArguments.max_grad_norm)
                 # 当训练步数整除累积步数时，进行参数更新
-                if (batch_index + 1) % self.trainingArguments.gradient_accumulation_steps == 0:
+                if cur_step % self.trainingArguments.gradient_accumulation_steps == 0:
+                    # 执行参数更新
                     self.optimizer.step()
+                    # 学习率调整
                     self.scheduler.step()
                     # 梯度清零
                     self.optimizer.zero_grad()
@@ -459,7 +466,7 @@ class MyTrainer:
                         step_des = f'{cur_step}/{self.get_num_training_steps}'
                         self.logger.info(f'Epoch: ({epoch_des}) Step: ({step_des}) Loss: ({loss}) EMA Loss: ({ema_loss})')
                     # 评估
-                    if (batch_index + 1) % self.trainingArguments.eval_steps == 0:
+                    if cur_step % self.trainingArguments.eval_steps == 0:
                         self.logger.info("开始评测......")
                         metric = self.evaluate()
                         self.logger.info(f'Epoch: ({epoch_des}) Step: ({step_des}) Accuracy: ({metric})')
@@ -531,7 +538,7 @@ class MyTrainer:
         torch.optim.lr_scheduler.CosineAnnealingLR
         lr_scheduler = get_scheduler(
             self.trainingArguments.lr_scheduler_type,
-            optimizer=self.optimizer if self.optimizer else optimizer,
+            optimizer=optimizer,
             num_warmup_steps=self.trainingArguments.get_warmup_steps(num_training_steps),
             num_training_steps=num_training_steps,
         )
@@ -576,6 +583,11 @@ if __name__ == '__main__':
     # 参数解析
     parser = HfArgumentParser((ModelArguments, DataArguments, MyTrainingArguments))
     modelArguments, dataArguments, trainingArguments = parser.parse_args_into_dataclasses()
+    logger = logging.getLogger(f'Rank:{trainingArguments.local_rank} {__name__}')
+    logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s - %(message)s", 
+                        datefmt="%Y/%m/%d %H:%M:%S",
+                        level=logging.INFO, 
+                        handlers=[logging.StreamHandler(sys.stdout)])
     # 数据预处理
     tokenizer = load_tokenizer_and_preprocess_dataset(dataArguments, modelArguments, trainingArguments, False, logger)
     # 加载数据
