@@ -1,13 +1,43 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
 # @File: run_clm_pt.py
-# @CreateTime: 2023/08/23 08:24:54
+# @CreateTime: 2023/08/25 14:38:22
 # @WeChat: damo894127201
 # @WeChat Official Accounts: NLP Journey
 # @Huggingface Organizations: NLP Journey
 # @Github: jialinzhang
-# @Instruction: 对LlaMA2进行二次预训练：训练embedding和lm_head层，冻结其它参数
-
+# @Instruction: 对LlaMA2-7b进行二次预训练：训练embedding和lm_head层，冻结其它参数
+'''
+一、模型训练说明
+    1、分布式训练类型: 单机多卡_单进程单卡
+    2、分布式训练技术:
+        2.1 数据并行: DDP
+        2.2 ZERO: FSDP
+        2.3 CPU卸载: CPUOffload
+        2.4 混合精度训练: Apex
+        2.5 梯度累积: gradient_accumulation_steps
+    3、模型训练技术:
+        3.1 学习率: warmup和scheduler
+        3.2 梯度裁剪: torch.nn.utils.clip_grad_norm_
+    4、pytorch分布式训练:
+        4.1 初始化进程组和分布式包: torch.distributed.init_process_group
+        4.1 数据加载: DataLoader 和 DistributedSampler
+        4.2 模型包裹: DistributedDataParallel
+二、模块结构
+    1、命令行参数类
+        1.1 数据相关参数
+        1.2 模型相关参数
+        1.3 训练相关参数
+        1.4 实验记录相关参数: wandb
+    2、辅助函数
+        2.1 指标计算函数
+        2.2 tokenizer加载函数
+    3、数据预处理
+    4、数据迭代器
+    5、模型加载
+    6、自定义训练器  
+'''
+import numpy as np
 import datasets
 from datasets import load_dataset, load_from_disk
 import torch
@@ -26,17 +56,20 @@ from transformers import (
 )
 from transformers.optimization import get_scheduler
 from sklearn.metrics import accuracy_score
+import wandb
 
 import sys
 import os
 import math
+import shutil
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Optional, Dict, Tuple, List
-from tqdm import tqdm, trange
+from typing import Optional, Dict, Tuple, List, Callable
+from tqdm import trange
 import logging
 
-# Step1: 参数设置和评测指标
+
+# Step1: 命令行参数设置
 @dataclass
 class DataArguments:
     """ 
@@ -78,7 +111,7 @@ class DataArguments:
     )
     
     overwrite_cache_processed_dataset: Optional[bool] = field(
-        default=True, metadata={"help": ("是否覆盖缓存的预处理后的训练和评估集")}
+        default=False, metadata={"help": ("是否覆盖缓存的预处理后的训练和评估集")}
     )
 
     preprocessing_num_workers: Optional[int] = field(
@@ -88,7 +121,6 @@ class DataArguments:
     processed_data_cache_dir: Optional[str] = field(
         default="./processed", metadata={"help": ("预处理后的数据集存储路径")}
     )
-
 
 @dataclass
 class ModelArguments:
@@ -179,6 +211,8 @@ class MyTrainingArguments(TrainingArguments):
     22、per_device_eval_batch_size: 训练期间,每个GPU上的batch_size
     23、eval_batch_size: 评估期间所有GPU上batch_size之和,无需设置,通过per_device_eval_batch_size*n_gpu自动计算
     24、gradient_accumulation_steps: 梯度累积步数
+    25、save_steps: 每多少个step保存模型
+    26、resume_from_checkpoint: 从断点加载模型
     ....
     
     与微调模型相关的参数
@@ -187,28 +221,66 @@ class MyTrainingArguments(TrainingArguments):
     
     debug_mode: Optional[bool] = field(default=False, metadata={"help": ("是否调试模式")})
     modules_to_train : Optional[str] = field(default=None, metadata={"help": "参与训练的网络层, example: embed_tokens,lm_head"})
-
-def accuracy(predictions, references, normalize=True, sample_weight=None):
-        return {
-            "accuracy": float(
-                accuracy_score(references, predictions, normalize=normalize, sample_weight=sample_weight)
+    save_interval_epoch: Optional[str] = field(default=1, meta={"help": "每多少个epoch保存checkpoint"})
+    
+@dataclass
+class WandbArguments:
+    project_name: Optional[str] = field(default="llama2", metadata={"help": "wandb实验项目名"})
+    team_name: Optional[str] = field(default="nlp-journey", metadata={"help": "wandb团队名"})
+    commit_message: Optional[str] = field(
+        default=None, 
+        metadata={
+            "help": (
+                "A longer description of the run, like a `-m` commit message in git." 
+                "This helps you remember what you were doing when you ran this run."
             )
         }
+    )
+    experiment_name: Optional[str] = field(default=None, metadata={"help": "实验名称"})
+    experiment_group: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Specify a group to organize individual runs into a larger experiment."
+                "For example, you might be doing cross validation, or you might have multiple jobs that train and evaluate a model against different test sets."
+                "Group gives you a way to organize runs together into a larger whole, and you can toggle this on and off in the UI"
+                "用于归类实验，比如训练的实验、评估的实验、测试的实验"
+            )
+        }
+    )
+    job_type: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Specify the type of run, which is useful when you're grouping runs together into larger experiments using group."
+                "For example, you might have multiple jobs in a group, with job types like train and eval." 
+                "Setting this makes it easy to filter and group similar runs together in the UI so you can compare apples to apples."
+            )
+        }
+    )
 
-def compute_metrics(preds, labels):
+# Step2: 辅助函数
+def metric(y_pred, y_true, normalize=True, sample_weight=None):
+    # y_pred: [batch_size*seq_len,]
+    # y_true: [batch_size*seq_len,]
+    return {
+        "accuracy": float(
+            accuracy_score(y_true, y_pred, normalize=normalize, sample_weight=sample_weight)
+        )
+    }
+
+def compute_metrics(preds: np.ndarray, labels: np.ndarray):
     # preds have the same shape as the labels, after the argmax(-1) has been calculated
     # by preprocess_logits_for_metrics but we need to shift the labels
+    # preds: [batch_size, seq_len]
+    # labels: [batch_size, seq_len]
     labels = labels[:, 1:].reshape(-1)
     preds = preds[:, :-1].reshape(-1)
-    return accuracy(predictions=preds, references=labels)        
-    
-
-# Step2: 数据预处理
-def load_tokenizer_and_preprocess_dataset(dataArguments: DataArguments,
-                                          modelArguments: ModelArguments,
-                                          trainingArguments: MyTrainingArguments,
-                                          only_load_tokenizer: bool,
-                                          logger: logging.RootLogger) -> LlamaTokenizer:
+    return metric(predictions=preds, references=labels)        
+ 
+def load_tokenizer(modelArguments: ModelArguments,
+                   trainingArguments: MyTrainingArguments,
+                   logger: logging.RootLogger) -> LlamaTokenizer:
     tokenizer_kwargs = {
         "cache_dir": modelArguments.cache_dir,
         "use_fast": modelArguments.use_fast_tokenizer,
@@ -217,70 +289,63 @@ def load_tokenizer_and_preprocess_dataset(dataArguments: DataArguments,
     }
     
     if modelArguments.tokenizer_name_or_path:
-        tokenizer = LlamaTokenizer.from_pretrained(modelArguments.tokenizer_name_or_path, **tokenizer_kwargs)
-        logger.info("分词器加载成功......")
+        logger.info(f"Local Rank: {trainingArguments.local_rank} 分词器加载成功......")
+        return LlamaTokenizer.from_pretrained(modelArguments.tokenizer_name_or_path, **tokenizer_kwargs)
     else:
-        raise ValueError("请配置分词器名称或路径: tokenizer_name_or_path")
-    # 只加载tokenizer，不进行数据预处理
-    if only_load_tokenizer:
-        return tokenizer
-    block_size = dataArguments.block_size
-    if block_size is None:
-        block_size = tokenizer.model_max_length
-    if block_size > 1024:
-        logger.warning(
-                "The chosen tokenizer supports a `model_max_length` that is longer than the default `block_size` value"
-                " of 1024. If you would like to use a longer `block_size` up to `tokenizer.model_max_length` you can"
-                " override this default with `--block_size xxx`."
-            )
-        block_size = 1024
-    else:
-        if dataArguments.block_size > tokenizer.model_max_length:
-            logger.warning(
-                f"The block_size passed ({dataArguments.block_size}) is larger than the maximum length for the model"
-                f"({tokenizer.model_max_length}). Using block_size={tokenizer.model_max_length}."
-            )
-        block_size = min(dataArguments.block_size, tokenizer.model_max_length)
-    def tokenize_function(examples: datasets.Dataset) -> Dict:
-        """ 
-        数据处理函数: 批量对数据集的制定列进行分词,并在句首添加<s>符号表示起始符bos
-        examples: 
-        例如, Dataset({
-                        features: ['text',...],
-                        num_rows: 2
-                    })
-        return:  {
-                'input_ids': [[1, 447, 29882, 801], [1, 447, 29882, 801]], 
-                'attention_mask': [[1, 1, 1, 1], [1, 1, 1, 1]]
-                }
-        """
-        return tokenizer(examples['text'])
-
-    def group_texts(examples: datasets.Dataset) -> Dict:
-        """
-        数据处理函数: 拼接分词后数据集中的所有文本, 并依据block_size, 生成block块
-        examples: 
-        例如, Dataset({
-                        features: ['input_ids','attention_mask',...],
-                        num_rows: 2
-                    })
-        return: 
-        """
-        # 拼接数据集中同一个特征的所有数据
-        # {'input_ids': [value,...], 'attention_mask': [value,...],....}
-        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-        total_length = len(concatenated_examples[list(concatenated_examples.keys())[0]])
-        # 丢掉切分后剩余的部分数据
-        if total_length >= block_size:
-            total_length = (total_length // block_size) * block_size
-        # 切分文本块
-        result = {
-            k: [t[i:i+block_size] for i in range(0, total_length, block_size)] 
-            for k,t in concatenated_examples.items()
-        }
-        result['label'] = result["input_ids"].copy()
-        return result
+        raise ValueError(f"Local Rank: {trainingArguments.local_rank} 请配置分词器名称或路径: tokenizer_name_or_path")
+ 
+# Step3: 数据预处理
+def preprocess_dataset(dataArguments: DataArguments,
+                       modelArguments: ModelArguments,
+                       trainingArguments: MyTrainingArguments,
+                       logger: logging.RootLogger):
+    # 只在主进程中进行数据预处理，同时阻塞其它副本进程
     with trainingArguments.main_process_first(desc='数据预处理'):
+        tokenizer = load_tokenizer(modelArguments, trainingArguments, logger)
+        if dataArguments.block_size is None:
+            block_size = tokenizer.model_max_length
+        else:
+            block_size = min(dataArguments.block_size, tokenizer.model_max_length)
+        def tokenize_function(examples: datasets.Dataset) -> Dict:
+            """ 
+            数据处理函数: 批量对数据集的制定列进行分词,并在句首添加<s>符号表示起始符bos
+            examples: 
+            例如, Dataset({
+                            features: ['text',...],
+                            num_rows: 2
+                        })
+            return:  {
+                    'input_ids': [[1, 447, 29882, 801], [1, 447, 29882, 801]], 
+                    'attention_mask': [[1, 1, 1, 1], [1, 1, 1, 1]]
+                    }
+            """
+            return tokenizer(examples['text'])
+
+        def group_texts(examples: datasets.Dataset) -> Dict:
+            """
+            数据处理函数: 拼接分词后数据集中的所有文本, 并依据block_size, 生成block块
+            examples: 
+            例如, Dataset({
+                            features: ['input_ids','attention_mask',...],
+                            num_rows: 2
+                        })
+            return: 
+            """
+            # 拼接数据集中同一个特征的所有数据
+            # {'input_ids': [value,...], 'attention_mask': [value,...],....}
+            concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+            total_length = len(concatenated_examples[list(concatenated_examples.keys())[0]])
+            # 丢掉切分后剩余的部分数据
+            if total_length >= block_size:
+                total_length = (total_length // block_size) * block_size
+            # 切分文本块
+            result = {
+                k: [t[i:i+block_size] for i in range(0, total_length, block_size)] 
+                for k,t in concatenated_examples.items()
+            }
+            result['label'] = result["input_ids"].copy()
+            return result
+        # 加载数据
         if dataArguments.dataset_dir:
             raw_datasets = load_dataset(path=dataArguments.dataset_dir, name=dataArguments.dataset_subset_name)
         elif dataArguments.train_file_path and dataArguments.eval_file_path and dataArguments.data_file_type:
@@ -312,18 +377,16 @@ def load_tokenizer_and_preprocess_dataset(dataArguments: DataArguments,
             desc='Grouping texts in chunks of {block_size}',
         )
         if dataArguments.overwrite_cache_processed_dataset:
-            os.removedirs(dataArguments.processed_data_cache_dir)
+            shutil.rmtree(dataArguments.processed_data_cache_dir)
             os.makedirs(dataArguments.processed_data_cache_dir, exist_ok=True)
         processed_datasets.save_to_disk(dataArguments.processed_data_cache_dir)
-        logger.info("数据预处理完毕......") 
-        return tokenizer
+        logger.info(f"Local Rank: {trainingArguments.local_rank} 数据预处理完毕......") 
 
-# Step3: 加载数据
-def create_dataloader(tokenizer: LlamaTokenizer,
-                      dataArguments: DataArguments,
-                      trainingArguments: MyTrainingArguments) -> Tuple[DataLoader]:
-    
-    processed_datasets = datasets.load_from_disk(dataArguments.processed_data_cache_dir)
+# Step4: 加载数据
+def prepare_dataloader(dataArguments: DataArguments,
+                       trainingArguments: MyTrainingArguments,
+                       logger: logging.RootLogger) -> Tuple[DataLoader]:
+    processed_datasets = load_from_disk(dataArguments.processed_data_cache_dir)
     if trainingArguments.do_train:
         train_dataset = processed_datasets['train']
     if trainingArguments.do_eval:
@@ -331,17 +394,11 @@ def create_dataloader(tokenizer: LlamaTokenizer,
     if trainingArguments.debug_mode:
         max_train_samples = min(len(train_dataset), dataArguments.max_train_samples)
         train_dataset = train_dataset.select(range(max_train_samples))
-        
-        logger.info(f"Num train_samples  {len(train_dataset)}")
-        logger.info("training example:")
-        logger.info(tokenizer.decode(train_dataset[0]['input_ids']))
+        logger.info(f"Local Rank: {trainingArguments.local_rank} Num train_samples  {len(train_dataset)}")
         
         max_eval_samples = min(len(eval_dataset), dataArguments.max_eval_samples)
         eval_dataset = eval_dataset.select(range(max_eval_samples))
-        
-        logger.info(f"Num eval_samples  {len(eval_dataset)}")
-        logger.info("evaling example:")
-        logger.info(tokenizer.decode(eval_dataset[0]['input_ids']))
+        logger.info(f"Local Rank: {trainingArguments.local_rank} Num eval_samples  {len(eval_dataset)}")
     
     def collate_fn(batch: List[Dict]):
         batch_input_ids, batch_attention_mask, batch_label = [], [], []
@@ -358,18 +415,20 @@ def create_dataloader(tokenizer: LlamaTokenizer,
     train_dataloader = DataLoader(dataset=train_dataset, 
                                   batch_size=trainingArguments.train_batch_size, 
                                   sampler=train_sampler,
-                                  collate_fn=collate_fn)
+                                  collate_fn=collate_fn,
+                                  drop_last=True)
     eval_dataloader = DataLoader(dataset=eval_dataset, 
                                  batch_size=trainingArguments.eval_batch_size,
-                                 collate_fn=collate_fn)
+                                 collate_fn=collate_fn,
+                                 drop_last=False)
     
     return train_dataloader, eval_dataloader, train_sampler
 
-# Step4: 加载模型
-def load_ddp_fsdp_model(tokenizer: LlamaTokenizer,
-                        modelArguments: ModelArguments,
-                        trainingArguments: MyTrainingArguments, 
-                        logger: logging.RootLogger) -> LlamaForCausalLM:
+# Step5: 加载模型
+def load_model(modelArguments: ModelArguments,
+               trainingArguments: MyTrainingArguments, 
+               logger: logging.RootLogger) -> LlamaForCausalLM:
+    tokenizer = load_tokenizer(modelArguments, trainingArguments, logger)
     model_config_kwargs = {
         "cache_dir": modelArguments.cache_dir,
         "revision": modelArguments.model_revision,
@@ -380,7 +439,6 @@ def load_ddp_fsdp_model(tokenizer: LlamaTokenizer,
     # 更新配置
     if modelArguments.config_overrides:
         model_config.update_from_string(modelArguments.config_overrides)
-
     if modelArguments.model_name_or_path:
         torch_dtype = (
             modelArguments.torch_dtype
@@ -397,166 +455,268 @@ def load_ddp_fsdp_model(tokenizer: LlamaTokenizer,
 
     # 扩充词嵌入矩阵
     model_vocab_size = model.get_output_embeddings().weight.size(0)
-    # model.resize_token_embeddings: 扩充embedding矩阵大徐爱和lm_head的输出维度大小
+    # 扩充embedding矩阵大小和lm_head的输出维度大小
     model.resize_token_embeddings(len(tokenizer))
-    logger.info(f"Llama raw vocab size is {model_vocab_size}")
-    logger.info(f"chinese medical tokenizer vocab size is {len(tokenizer)}")
-    logger.info("The vocab embedding has been expanded.")
+    logger.info(f"Local Rank: {trainingArguments.local_rank} Llama raw vocab size is {model_vocab_size}")
+    logger.info(f"Local Rank: {trainingArguments.local_rank} chinese medical tokenizer vocab size is {len(tokenizer)}")
+    logger.info(f"Local Rank: {trainingArguments.local_rank} The vocab embedding has been expanded.")
     
     # 数据并行
-    model = DDP(module=model.cuda(trainingArguments.local_rank), device_ids=[trainingArguments.local_rank])
+    # model = DDP(module=model.cuda(trainingArguments.local_rank), device_ids=[trainingArguments.local_rank])
     # model = FSDP(module=model, cpu_offload=CPUOffload(offload_params=True))
     
     return model
 
-# Step5: 训练器
+# Step6: 构建训练器
 class MyTrainer:
     """ 自定义训练器 """
-    def __init__(self, 
+    def __init__(self,
                  model: torch.nn.Module,
                  train_dataloader: DataLoader,
                  eval_dataloader: DataLoader,
                  trainSampler: DistributedSampler,
                  trainingArguments: MyTrainingArguments,
+                 wandbArguments: WandbArguments,
+                 compute_metrics: Callable[[np.ndarray, np.ndarray], Dict],
                  logger: logging.RootLogger
                  ):
-        self.model = model
+        # 静态参数
+        self.n_gpus = torch.cuda.device_count()
+        self.gpu_id = trainingArguments.local_rank
+        self.lr = trainingArguments.learning_rate
+        self.lr_scheduler_type = trainingArguments.lr_scheduler_type
+        self.adam_beta1 = trainingArguments.adam_beta1
+        self.adam_beta2 = trainingArguments.adam_beta2
+        self.adam_epsilon = trainingArguments.adam_epsilon
+        self.weight_decay = trainingArguments.weight_decay
+        # 每多少个batch进行梯度更新
+        self.gradient_accumulation_steps = trainingArguments.gradient_accumulation_steps
+        self.max_grad_norm = trainingArguments.max_grad_norm
+        self.modules_to_train = trainingArguments.modules_to_train
+        self.epochs_run = 0 # 已训练epoch个数
+        self.steps_update = 0 # 已更新参数的次数
+        self.num_train_epochs = trainingArguments.num_train_epochs
+        self.train_batch_size = trainingArguments.train_batch_size
+        self.eval_batch_size = trainingArguments.eval_batch_size
+        self.snapshot_path = trainingArguments.resume_from_checkpoint
+        self.output_dir = trainingArguments.output_dir
+        self.save_steps = trainingArguments.save_steps
+        self.save_interval_epoch = trainingArguments.save_interval_epoch
+        # 采用梯度累积时，指代参数更新的次数
+        self.eval_steps = trainingArguments.eval_steps
+        self.logging_steps = trainingArguments.logging_steps
+        self.logger = logger
         self.train_dataloader = train_dataloader
         self.eval_dataloader = eval_dataloader
         self.trainSampler = trainSampler
-        self.trainingArguments = trainingArguments
-        self.logger = logger
-        self.n_gpus = torch.cuda.device_count()
-        self.optimizer, self.scheduler = self.create_optimizer_and_scheduler()
+        self.compute_metrics = compute_metrics
+        # 加载模型
+        self.model = model
+        if os.path.exists(self.snapshot_path):
+            self.logger.info(f'Local Rank: {self.gpu_id} start loading snapshot')
+            self._load_snapshot(self.snapshot_path)
+            self.logger.info(f"Local Rank: {self.gpu_id} Resuming training from snapshot at Epoch {self.epochs_run}")
+        self.model = model.to(self.gpu_id)
+        # 动态参数
+        self.num_training_steps = self._get_num_training_steps(trainingArguments.max_steps) # 参数最大更新次数
+        self.every_epoch_training_steps = len(self.train_dataloader) // self.gradient_accumulation_steps
+        self.warmup_steps = trainingArguments.get_warmup_steps(self.num_training_steps)
+        self.training_params = self._get_training_params()
+        self.num_training_params = self._get_num_params(only_trainable=True, exclude_embeddings=False)
+        self.total_num_params = self._get_num_params(only_trainable=False, exclude_embeddings=False)
         
+        # 数据并行
+        self._ddp_setup()
+        self.optimizer, self.scheduler = self._create_optimizer_and_scheduler()
+        self.model = DDP(model, device_ids=[self.gpu_id])
         
+        import wandb
+        self.wandb = wandbArguments
+        self.post_init()
+        
+    def post_init(self):
+        training_config = {
+            'model': 'llama2-7b',
+            'learning_rate': self.lr,
+            'lr_sheduler_type': self.lr_scheduler_type,
+            'adam_beta1': self.adam_beta1,
+            'adam_beta2': self.adam_beta2,
+            'adam_epsilon': self.adam_epsilon,
+            'weight_decay': self.weight_decay,
+            'warmup_steps': self.warmup_steps,
+            'num_training_epochs': self.num_train_epochs,
+            'num_training_steps': self.num_training_steps,
+            'modules_to_train': self.modules_to_train,
+            'max_grad_norm': self.max_grad_norm,
+            'gradient_accumulation_steps': self.max_grad_norm,
+            'train_batch_size': self.train_batch_size,
+            'eval_batch_size': self.eval_batch_size,
+            'n_gpus': self.n_gpus,
+            'every_epoch_training_steps': self.every_epoch_training_steps,
+            'num_training_params': self.num_training_params,
+            'total_num_params': self.total_num_params
+        }
+        wandb.init(
+            config=training_config,
+            project=self.wandb.project_name,
+            entity=self.wandb.team_name,
+            name=self.wandb.experiment_name,
+            notes=self.wandb.commit_message,
+            group=self.wandb.experiment_group,
+            job_type=self.wandb.job_type,
+            reinit=True
+        )
+    
     def train(self):
-        if self.trainingArguments.device == "cuda":
-            torch.cuda.empty_cache()
+        if self.gpu_id == 0:
+            percentage = round(self.num_training_params / self.total_num_params, 2) * 100
+            self.logger.info(f'Training parameters number is {self.num_training_params}, Total parameters number is {self.total_num_params}, accounted for {percentage}%')
+        torch.cuda.empty_cache()
         self.model.train()
-        for epoch_index in trange(int(self.trainingArguments.num_train_epochs), desc="Epoch", disable=False):
-            self.trainSampler.set_epoch(epoch_index)
-            ema_loss = 0
-            num_batches = len(self.train_dataloader)
-            for batch_index, batch in enumerate(self.train_dataloader):
-                cur_step = num_batches*epoch_index + batch_index + 1
-                batch_input_ids, batch_attention_mask, batch_label = batch
-                outputs = self.model(input_ids=batch_input_ids, attention_mask=batch_attention_mask, labels=batch_label)
-                loss = outputs[0]
-                loss.requires_grad_(True)
-                # 判断是否进行梯度累积，如果进行，则将损失值除以累积步数
-                if self.trainingArguments.gradient_accumulation_steps > 0:
-                    loss = loss / self.trainingArguments.gradient_accumulation_steps
-                ema_loss = 0.9 * ema_loss + 0.1 * loss.item()
-                # 计算梯度值,并累加梯度
-                loss.backward()
-                # 梯度裁剪
-                torch.nn.utils.clip_grad_norm([p for n,p in self.train_params], self.trainingArguments.max_grad_norm)
-                # 当训练步数整除累积步数时，进行参数更新
-                if cur_step % self.trainingArguments.gradient_accumulation_steps == 0:
-                    # 执行参数更新
-                    self.optimizer.step()
-                    # 学习率调整
-                    self.scheduler.step()
-                    # 梯度清零
-                    self.optimizer.zero_grad()
-                    # 日志输出
-                    if self.trainingArguments.local_rank == 0:
-                        epoch_des = f'{epoch_index}/{self.trainingArguments.num_train_epochs}'
-                        step_des = f'{cur_step}/{self.get_num_training_steps}'
-                        self.logger.info(f'Epoch: ({epoch_des}) Step: ({step_des}) Loss: ({loss}) EMA Loss: ({ema_loss})')
-                    # 评估
-                    if cur_step % self.trainingArguments.eval_steps == 0:
-                        self.logger.info("开始评测......")
-                        metric = self.evaluate()
-                        self.logger.info(f'Epoch: ({epoch_des}) Step: ({step_des}) Accuracy: ({metric})')
-                        self.logger.info("评测结束......")
-                # 模型保存
-                if (epoch_index + 1) % self.trainingArguments.num_train_epochs == 0 and self.trainingArguments.local_rank == 0:
-                    os.makedirs(self.trainingArguments.model_save_path, exist_ok=True)
-                    self.save_model(epoch_index, batch_index, ema_loss)
+        for epoch in trange(1, math.ceil(self.num_train_epochs+1), desc='Epoch', disable=False):
+            self._run_epoch(epoch)
+            if self.gpu_id == 0 and (epoch % self.save_interval_epoch == 0) or (self.steps_update % self.save_steps) == 0:
+                self._save_snapshot(epoch)
+            # 达到最大更新步数，退出训练
+            if self.steps_update > self.num_training_steps:
+                self._save_snapshot(epoch)
+                break
+        self.logger.info(f'Local Rank: {self.gpu_id} 训练结束!')
     
     @torch.no_grad()
-    def evaluate(self):
+    def evaluate(self, epoch: int):
+        self.logger.info(f'Local Rank: {self.gpu_id} 开始评测...')
         self.model.eval()
         metric = 0
+        avg_loss = 0
         for step, batch in enumerate(self.eval_dataloader):
-            input_ids = batch['input_ids'].cuda(self.trainingArguments.local_rank)
-            attention_mask = batch['attention_mask'].cuda(self.trainingArguments.local_rank)
-            label = batch['label'].cuda(self.trainingArguments.local_rank)
-            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=label)
-            logits = outputs[1]
-            metric += accuracy(logits.item(), label)
+            batch_input_ids, batch_attention_mask, batch_label = batch
+            outputs = self.model(input_ids=batch_input_ids, attention_mask=batch_attention_mask, labels=batch_label)
+            loss, logits = outputs[0].item(), outputs[1].cpu()
+            batch_label = batch_label.cpu()
+            metric += self.compute_metrics(logits.argmax(dim=-1), batch_label)['accuracy']
+            avg_loss += loss
         self.model.train()
-        return metric / (step + 1)
+        metric, avg_loss = metric / (step + 1), avg_loss / (step + 1)
+        self.logger.info(f'Local Rank: {self.gpu_id} Evaluate Epoch: {epoch}/{self.num_train_epochs} Step: {self.steps_update} Metric: {metric} Eval Loss: {avg_loss}')
+        wandb.log({"eval_loss": avg_loss}, step=self.steps_update)
+        wandb.log({"eval_accuracy": metric}, step=self.steps_update)
     
-    def save_model(self, epoch_index, batch_index, loss):
-        os.makedirs(self.trainingArguments.output_dir, exist_ok=True)
-        save_file = os.path.join(self.trainingArguments.output_dir, f"epoch_{epoch_index}.pt")
-        torch.save({
-            'epoch': epoch_index,
-            'step': batch_index,
-            'model_state_dict': self.model.module.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'ema_loss': loss,
-        }, save_file)
-        self.logger.info(f'checkpoint has been save in {save_file}')
-          
-    def create_optimizer_and_scheduler(self):
-        num_training_steps = self.get_num_training_steps()
+    def _run_epoch(self, epoch: int):
+        self.trainSampler.set_epoch(epoch)
+        self.optimizer.zero_grad()
+        # 在梯度累积步数内的损失
+        cur_loss = 0
+        for batch_index, batch in enumerate(self.train_dataloader):
+            loss = self._run_batch(batch)
+            cur_loss += loss
+            # 当经过梯度累积步数个batch后，进行参数更新
+            if (batch_index + 1) % self.gradient_accumulation_steps == 0:
+                self._update_params()
+                cur_loss = 0
+                self.steps_update += 1 # 记录参数更新次数
+                if self.gpu_id == 0:
+                    if self.steps_update % self.logging_steps == 0:
+                        self._log_training_info(epoch, cur_loss)
+                    if self.steps_update % self.eval_steps == 0:
+                        self.evaluate()
+            # 达到最大更新步数，退出训练
+            if self.steps_update > self.num_training_steps:
+                break
+                     
+    def _run_batch(self, batch):
+        batch_input_ids, batch_attention_mask, batch_label = batch
+        outputs = self.model(input_ids=batch_input_ids, attention_mask=batch_attention_mask, labels=batch_label)
+        loss = outputs[0]
+        loss.requires_grad_(True)
+        # 判断是否进行梯度累积，如果进行，则将损失值除以累积步数
+        if self.gradient_accumulation_steps > 0:
+            loss = loss / self.gradient_accumulation_steps
+        # 计算梯度值,并累加梯度
+        loss.backward()
+        # 裁剪梯度
+        torch.nn.utils.clip_grad_norm_([p for n,p in self.training_params], self.max_grad_norm)
+        return loss.item()
+    
+    def _update_params(self):
+        # 执行参数更新
+        self.optimizer.step()
+        # 学习率调整
+        self.scheduler.step()
+        # 梯度清零
+        self.optimizer.zero_grad()
+        
+    def _log_training_info(self, epoch:int, loss: float):
+        content = f'Local Rank: {self.gpu_id} | Epoch {epoch}/{self.num_train_epochs} | Step {self.steps_update}/{self.num_training_steps} | Loss: {loss}'
+        self.logger.info(content)
+        wandb.log({'training_loss': loss}, step=self.steps_update)
+              
+    def _load_snapshot(self, snapshot_path: str):
+        loc = torch.device('cpu')
+        snap_shot = torch.load(snapshot_path, map_location=loc)
+        self.model.load_state_dict(snap_shot['MODEL_STATE'])
+        self.epochs_run = snap_shot['EPOCHS_RUN']
+        self.steps_update = snap_shot['STEP']
+    
+    def _save_snapshot(self, epoch: int):
+        snapshot = {
+            "MODEL_STATE": self.model.module.state_dict(),
+            "EPOCHS_RUN": epoch,
+            "STEP": self.steps_update
+        }
+        save_path = os.path.join(self.output_dir, f"pytorch_model_epoch_{epoch}_step_{self.steps_update}.bin")
+        torch.save(snapshot, f'{save_path}')
+        self.logger.info(f'Local Rank: {self.gpu_id} Epoch {epoch} STEP {self.steps_update}| Training snapshot saved at {save_path}')
+    
+    def _create_optimizer_and_scheduler(self):
         optimizer = self.create_optimizer()
-        scheduler = self.create_scheduler(num_training_steps, optimizer)
+        scheduler = self.create_scheduler(optimizer)
         return optimizer, scheduler
     
-    def create_optimizer(self):
+    def _create_optimizer(self):
         no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
         optimizer_grouped_parameters = [
             {
-                'params': [p for n, p in self.train_params if not any(nd in n for nd in no_decay)],
-                'weight_decay': self.trainingArguments.weight_decay
+                'params': [p for n, p in self.training_params if not any(nd in n for nd in no_decay)],
+                'weight_decay': self.weight_decay
             },
             {
-                'params': [p for n, p in self.train_params if any(nd in n for nd in no_decay)],
+                'params': [p for n, p in self.training_params if any(nd in n for nd in no_decay)],
                 'weight_decay': 0.0
             }
         ]
         optimizer = torch.optim.AdamW(params=optimizer_grouped_parameters,
-                                      lr=self.trainingArguments.learning_rate,
-                                      betas=(self.trainingArguments.adam_beta1, self.trainingArguments.adam_beta2),
-                                      eps=self.trainingArguments.adam_epsilon,
-                                      weight_decay=self.trainingArguments.weight_decay)
+                                      lr=self.lr,
+                                      betas=(self.adam_beta1, self.adam_beta2),
+                                      eps=self.adam_epsilon,
+                                      weight_decay=self.weight_decay)
         return optimizer
     
-    def create_scheduler(self, num_training_steps: int, optimizer: torch.optim.Optimizer = None):
-        """
-        Setup the scheduler. The optimizer of the trainer must have been set up either before this method is called or
-        passed as an argument.
-
-        Args:
-            num_training_steps (int): The number of training steps to do.
-        """
-        torch.optim.lr_scheduler.CosineAnnealingLR
+    def _create_scheduler(self, optimizer: torch.optim.Optimizer = None):
         lr_scheduler = get_scheduler(
-            self.trainingArguments.lr_scheduler_type,
+            self.lr_scheduler_type,
             optimizer=optimizer,
-            num_warmup_steps=self.trainingArguments.get_warmup_steps(num_training_steps),
-            num_training_steps=num_training_steps,
+            num_warmup_steps=self.warmup_steps,
+            num_training_steps=self.num_training_steps,
         )
         return lr_scheduler
     
-    def get_num_training_steps(self):
-        if self.trainingArguments.max_steps > 0:
-            return self.trainingArguments.max_steps
+    def _ddp_setup(self):
+        torch.distributed.init_process_group(backend="nccl", init_method="env://")
+        torch.cuda.set_device(self.gpu_id)
+
+    def _get_num_training_steps(self, max_steps):
+        if max_steps > 0:
+            return max_steps
         len_dataloader = len(self.train_dataloader)
-        num_update_steps_per_epoch = len_dataloader // self.trainingArguments.gradient_accumulation_steps
+        num_update_steps_per_epoch = len_dataloader // self.gradient_accumulation_steps
         num_update_steps_per_epoch = max(num_update_steps_per_epoch, 1)
-        max_steps = math.ceil(self.trainingArguments.num_train_epochs * num_update_steps_per_epoch)
+        max_steps = math.ceil((self.num_train_epochs - self.epochs_run) * num_update_steps_per_epoch)
         return max_steps
     
-    @property
-    def train_params(self):
+    def _get_training_params(self):
         """ 获取训练参数 """
-        train_modules = self.trainingArguments.modules_to_train.strip().split(',')
+        train_modules = self.modules_to_train.strip().split(',')
         for name, value in self.model.named_parameters():
             module_name = name.split('.')[0]
             if module_name in train_modules:
@@ -565,41 +725,43 @@ class MyTrainer:
             value.requires_grad = False
         return filter(lambda item:item[1].requires_grad, self.model.named_parameters())
     
-    @property
-    def num_parameters(self, only_trainable: bool = False, exclude_embeddings: bool = False) -> int:
+    def _get_num_params(self, only_trainable: bool = False, exclude_embeddings: bool = False) -> int:
         """ 获取参数数量"""
         if exclude_embeddings:
             embedding_param_names = [
-                f"{name}.weight" for name, module_type in self.named_modules() if isinstance(module_type, torch.nn.Embedding)
+                f"{name}.weight" for name, module_type in self.model.named_modules() if isinstance(module_type, torch.nn.Embedding)
             ]
             non_embedding_parameters = [
-                parameter for name, parameter in self.named_parameters() if name not in embedding_param_names
+                parameter for name, parameter in self.model.named_parameters() if name not in embedding_param_names
             ]
             return sum(p.numel() for p in non_embedding_parameters if p.requires_grad or not only_trainable)
         else:
-            return sum(p.numel() for p in self.parameters() if p.requires_grad or not only_trainable)
+            return sum(p.numel() for p in self.model.parameters() if p.requires_grad or not only_trainable)
 
 if __name__ == '__main__':
     # 参数解析
-    parser = HfArgumentParser((ModelArguments, DataArguments, MyTrainingArguments))
-    modelArguments, dataArguments, trainingArguments = parser.parse_args_into_dataclasses()
+    parser = HfArgumentParser((ModelArguments, DataArguments, MyTrainingArguments, WandbArguments))
+    modelArguments, dataArguments, trainingArguments, wandbArguments = parser.parse_args_into_dataclasses()
+    # 日志记录
     logger = logging.getLogger(f'Rank:{trainingArguments.local_rank} {__name__}')
     logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s - %(message)s", 
                         datefmt="%Y/%m/%d %H:%M:%S",
                         level=logging.INFO, 
                         handlers=[logging.StreamHandler(sys.stdout)])
     # 数据预处理
-    tokenizer = load_tokenizer_and_preprocess_dataset(dataArguments, modelArguments, trainingArguments, False, logger)
+    preprocess_dataset(dataArguments, modelArguments, trainingArguments, logger)
     # 加载数据
-    train_dataloader, eval_dataloader, trainSampler = create_dataloader(tokenizer, dataArguments, trainingArguments)
+    train_dataloader, eval_dataloader, trainSampler = prepare_dataloader(dataArguments, trainingArguments, logger)
     # 加载模型
-    model = load_ddp_fsdp_model(tokenizer, modelArguments, trainingArguments, logger)
+    model = load_model(modelArguments, trainingArguments, logger)
     # 构建训练器
     trainer = MyTrainer(model=model, 
                         train_dataloader=train_dataloader, 
                         eval_dataloader=eval_dataloader, 
                         trainSampler=trainSampler, 
                         trainingArguments=trainingArguments,
+                        wandbArguments=wandbArguments,
+                        compute_metrics=compute_metrics,
                         logger=logger)
     trainer.train()
-    logger.info("训练结束!")
+    logger.info(f"Rank:{trainingArguments.local_rank} 训练结束!")
