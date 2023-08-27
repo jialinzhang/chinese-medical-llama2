@@ -465,6 +465,10 @@ def load_model(modelArguments: ModelArguments,
     # model = DDP(module=model.cuda(trainingArguments.local_rank), device_ids=[trainingArguments.local_rank])
     # model = FSDP(module=model, cpu_offload=CPUOffload(offload_params=True))
     
+    # 数据并行
+    model = DDP(module=model.cuda(trainingArguments.local_rank), device_ids=[trainingArguments.local_rank])
+    # model = FSDP(module=model, cpu_offload=CPUOffload(offload_params=True))
+    
     return model
 
 # Step6: 构建训练器
