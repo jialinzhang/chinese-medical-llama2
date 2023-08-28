@@ -44,6 +44,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
 from torch.distributed.fsdp.api import CPUOffload
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 import transformers
@@ -221,7 +222,7 @@ class MyTrainingArguments(TrainingArguments):
     
     debug_mode: Optional[bool] = field(default=False, metadata={"help": ("是否调试模式")})
     modules_to_train : Optional[str] = field(default=None, metadata={"help": "参与训练的网络层, example: embed_tokens,lm_head"})
-    save_interval_epoch: Optional[str] = field(default=1, meta={"help": "每多少个epoch保存checkpoint"})
+    save_interval_epoch: Optional[int] = field(default=1, metadata={"help": "每多少个epoch保存checkpoint"})
     
 @dataclass
 class WandbArguments:
@@ -269,14 +270,14 @@ def metric(y_pred, y_true, normalize=True, sample_weight=None):
         )
     }
 
-def compute_metrics(preds: np.ndarray, labels: np.ndarray):
-    # preds have the same shape as the labels, after the argmax(-1) has been calculated
-    # by preprocess_logits_for_metrics but we need to shift the labels
-    # preds: [batch_size, seq_len]
-    # labels: [batch_size, seq_len]
-    labels = labels[:, 1:].reshape(-1)
-    preds = preds[:, :-1].reshape(-1)
-    return metric(predictions=preds, references=labels)        
+def compute_metrics(y_pred: np.ndarray, y_true: np.ndarray):
+    # y_pred have the same shape as the labels, after the argmax(-1) has been calculated
+    # by preprocess_logits_for_metrics but we need to shift the y_true
+    # y_pred: [batch_size, seq_len]
+    # y_true: [batch_size, seq_len]
+    y_true = y_true[:, 1:].reshape(-1)
+    y_pred = y_pred[:, :-1].reshape(-1)
+    return metric(y_pred=y_pred, y_true=y_true)        
  
 def load_tokenizer(modelArguments: ModelArguments,
                    trainingArguments: MyTrainingArguments,
@@ -294,6 +295,10 @@ def load_tokenizer(modelArguments: ModelArguments,
     else:
         raise ValueError(f"Local Rank: {trainingArguments.local_rank} 请配置分词器名称或路径: tokenizer_name_or_path")
  
+def ddp_setup():
+    init_process_group(backend="nccl", init_method="env://")
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
 # Step3: 数据预处理
 def preprocess_dataset(dataArguments: DataArguments,
                        modelArguments: ModelArguments,
@@ -461,14 +466,6 @@ def load_model(modelArguments: ModelArguments,
     logger.info(f"Local Rank: {trainingArguments.local_rank} chinese medical tokenizer vocab size is {len(tokenizer)}")
     logger.info(f"Local Rank: {trainingArguments.local_rank} The vocab embedding has been expanded.")
     
-    # 数据并行
-    # model = DDP(module=model.cuda(trainingArguments.local_rank), device_ids=[trainingArguments.local_rank])
-    # model = FSDP(module=model, cpu_offload=CPUOffload(offload_params=True))
-    
-    # 数据并行
-    model = DDP(module=model.cuda(trainingArguments.local_rank), device_ids=[trainingArguments.local_rank])
-    # model = FSDP(module=model, cpu_offload=CPUOffload(offload_params=True))
-    
     return model
 
 # Step6: 构建训练器
@@ -515,12 +512,11 @@ class MyTrainer:
         self.trainSampler = trainSampler
         self.compute_metrics = compute_metrics
         # 加载模型
-        self.model = model
+        self.model = model.to(self.gpu_id)
         if os.path.exists(self.snapshot_path):
             self.logger.info(f'Local Rank: {self.gpu_id} start loading snapshot')
             self._load_snapshot(self.snapshot_path)
             self.logger.info(f"Local Rank: {self.gpu_id} Resuming training from snapshot at Epoch {self.epochs_run}")
-        self.model = model.to(self.gpu_id)
         # 动态参数
         self.num_training_steps = self._get_num_training_steps(trainingArguments.max_steps) # 参数最大更新次数
         self.every_epoch_training_steps = len(self.train_dataloader) // self.gradient_accumulation_steps
@@ -528,11 +524,10 @@ class MyTrainer:
         self.training_params = self._get_training_params()
         self.num_training_params = self._get_num_params(only_trainable=True, exclude_embeddings=False)
         self.total_num_params = self._get_num_params(only_trainable=False, exclude_embeddings=False)
+        self.optimizer, self.scheduler = self._create_optimizer_and_scheduler()
         
         # 数据并行
-        self._ddp_setup()
-        self.optimizer, self.scheduler = self._create_optimizer_and_scheduler()
-        self.model = DDP(model, device_ids=[self.gpu_id])
+        self.model = DDP(self.model, device_ids=[self.gpu_id])
         
         import wandb
         self.wandb = wandbArguments
@@ -573,13 +568,13 @@ class MyTrainer:
     
     def train(self):
         if self.gpu_id == 0:
-            percentage = round(self.num_training_params / self.total_num_params, 2) * 100
+            percentage = round(self.num_training_params / self.total_num_params * 100, 2)
             self.logger.info(f'Training parameters number is {self.num_training_params}, Total parameters number is {self.total_num_params}, accounted for {percentage}%')
         torch.cuda.empty_cache()
         self.model.train()
         for epoch in trange(1, math.ceil(self.num_train_epochs+1), desc='Epoch', disable=False):
             self._run_epoch(epoch)
-            if self.gpu_id == 0 and (epoch % self.save_interval_epoch == 0) or (self.steps_update % self.save_steps) == 0:
+            if self.gpu_id == 0 and (epoch % self.save_interval_epoch == 0) or (self.steps_update % self.save_steps == 0):
                 self._save_snapshot(epoch)
             # 达到最大更新步数，退出训练
             if self.steps_update > self.num_training_steps:
@@ -623,7 +618,7 @@ class MyTrainer:
                     if self.steps_update % self.logging_steps == 0:
                         self._log_training_info(epoch, cur_loss)
                     if self.steps_update % self.eval_steps == 0:
-                        self.evaluate()
+                        self.evaluate(epoch)
             # 达到最大更新步数，退出训练
             if self.steps_update > self.num_training_steps:
                 break
@@ -656,7 +651,7 @@ class MyTrainer:
         wandb.log({'training_loss': loss}, step=self.steps_update)
               
     def _load_snapshot(self, snapshot_path: str):
-        loc = torch.device('cpu')
+        loc = f'cuda:{self.gpu_id}'
         snap_shot = torch.load(snapshot_path, map_location=loc)
         self.model.load_state_dict(snap_shot['MODEL_STATE'])
         self.epochs_run = snap_shot['EPOCHS_RUN']
@@ -668,17 +663,18 @@ class MyTrainer:
             "EPOCHS_RUN": epoch,
             "STEP": self.steps_update
         }
+        os.makedirs(self.output_dir, exist_ok=True)
         save_path = os.path.join(self.output_dir, f"pytorch_model_epoch_{epoch}_step_{self.steps_update}.bin")
         torch.save(snapshot, f'{save_path}')
         self.logger.info(f'Local Rank: {self.gpu_id} Epoch {epoch} STEP {self.steps_update}| Training snapshot saved at {save_path}')
     
     def _create_optimizer_and_scheduler(self):
-        optimizer = self.create_optimizer()
-        scheduler = self.create_scheduler(optimizer)
+        optimizer = self._create_optimizer()
+        scheduler = self._create_scheduler(optimizer)
         return optimizer, scheduler
     
     def _create_optimizer(self):
-        no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+        no_decay = ['bias', 'layernorm', 'norm']
         optimizer_grouped_parameters = [
             {
                 'params': [p for n, p in self.training_params if not any(nd in n for nd in no_decay)],
@@ -704,10 +700,6 @@ class MyTrainer:
             num_training_steps=self.num_training_steps,
         )
         return lr_scheduler
-    
-    def _ddp_setup(self):
-        torch.distributed.init_process_group(backend="nccl", init_method="env://")
-        torch.cuda.set_device(self.gpu_id)
 
     def _get_num_training_steps(self, max_steps):
         if max_steps > 0:
@@ -722,12 +714,11 @@ class MyTrainer:
         """ 获取训练参数 """
         train_modules = self.modules_to_train.strip().split(',')
         for name, value in self.model.named_parameters():
-            module_name = name.split('.')[0]
-            if module_name in train_modules:
+            if any(module_name in name for module_name in train_modules):
                 value.requires_grad = True
                 continue
             value.requires_grad = False
-        return filter(lambda item:item[1].requires_grad, self.model.named_parameters())
+        return list(filter(lambda item:item[1].requires_grad, self.model.named_parameters()))
     
     def _get_num_params(self, only_trainable: bool = False, exclude_embeddings: bool = False) -> int:
         """ 获取参数数量"""
@@ -743,6 +734,8 @@ class MyTrainer:
             return sum(p.numel() for p in self.model.parameters() if p.requires_grad or not only_trainable)
 
 if __name__ == '__main__':
+    # 初始化进程组
+    ddp_setup()
     # 参数解析
     parser = HfArgumentParser((ModelArguments, DataArguments, MyTrainingArguments, WandbArguments))
     modelArguments, dataArguments, trainingArguments, wandbArguments = parser.parse_args_into_dataclasses()
@@ -768,4 +761,4 @@ if __name__ == '__main__':
                         compute_metrics=compute_metrics,
                         logger=logger)
     trainer.train()
-    logger.info(f"Rank:{trainingArguments.local_rank} 训练结束!")
+    destroy_process_group()
