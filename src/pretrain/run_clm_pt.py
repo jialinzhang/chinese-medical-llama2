@@ -465,7 +465,6 @@ def load_model(modelArguments: ModelArguments,
     logger.info(f"Local Rank: {trainingArguments.local_rank} Llama raw vocab size is {model_vocab_size}")
     logger.info(f"Local Rank: {trainingArguments.local_rank} chinese medical tokenizer vocab size is {len(tokenizer)}")
     logger.info(f"Local Rank: {trainingArguments.local_rank} The vocab embedding has been expanded.")
-    
     return model
 
 # Step6: 构建训练器
