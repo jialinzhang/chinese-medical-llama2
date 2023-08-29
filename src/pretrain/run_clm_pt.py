@@ -8,22 +8,7 @@
 # @Github: jialinzhang
 # @Instruction: 对LlaMA2-7b进行二次预训练：训练embedding和lm_head层，冻结其它参数
 '''
-一、模型训练说明
-    1、分布式训练类型: 单机多卡_单进程单卡
-    2、分布式训练技术:
-        2.1 数据并行: DDP
-        2.2 ZERO: FSDP
-        2.3 CPU卸载: CPUOffload
-        2.4 混合精度训练: Apex
-        2.5 梯度累积: gradient_accumulation_steps
-    3、模型训练技术:
-        3.1 学习率: warmup和scheduler
-        3.2 梯度裁剪: torch.nn.utils.clip_grad_norm_
-    4、pytorch分布式训练:
-        4.1 初始化进程组和分布式包: torch.distributed.init_process_group
-        4.1 数据加载: DataLoader 和 DistributedSampler
-        4.2 模型包裹: DistributedDataParallel
-二、模块结构
+一、模块结构:
     1、命令行参数类
         1.1 数据相关参数
         1.2 模型相关参数
@@ -35,7 +20,9 @@
     3、数据预处理
     4、数据迭代器
     5、模型加载
-    6、自定义训练器  
+    6、自定义训练器
+二、训练类型: 单机多卡_单进程单卡(模型可加载至单卡中) 数据并行DDP
+    llama2-7b float32占28GB float16占14GB 
 '''
 import numpy as np
 import datasets
@@ -45,8 +32,6 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-from torch.distributed.fsdp.api import CPUOffload
-from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 import transformers
 from transformers import (
     TrainingArguments,
@@ -223,6 +208,8 @@ class MyTrainingArguments(TrainingArguments):
     debug_mode: Optional[bool] = field(default=False, metadata={"help": ("是否调试模式")})
     modules_to_train : Optional[str] = field(default=None, metadata={"help": "参与训练的网络层, example: embed_tokens,lm_head"})
     save_interval_epoch: Optional[int] = field(default=1, metadata={"help": "每多少个epoch保存checkpoint"})
+    steps_update: Optional[int] = field(default=0, metadata={"help": "参数已更新次数, 用于加载checkpoint中的step"})
+    epochs_run: Optional[int] = field(default=0, metadata={"help": "已训练过的epoch次数, 用于加载checkpoint中的epoch"})
     
 @dataclass
 class WandbArguments:
@@ -304,88 +291,86 @@ def preprocess_dataset(dataArguments: DataArguments,
                        modelArguments: ModelArguments,
                        trainingArguments: MyTrainingArguments,
                        logger: logging.RootLogger):
-    # 只在主进程中进行数据预处理，同时阻塞其它副本进程
-    with trainingArguments.main_process_first(desc='数据预处理'):
-        tokenizer = load_tokenizer(modelArguments, trainingArguments, logger)
-        if dataArguments.block_size is None:
-            block_size = tokenizer.model_max_length
-        else:
-            block_size = min(dataArguments.block_size, tokenizer.model_max_length)
-        def tokenize_function(examples: datasets.Dataset) -> Dict:
-            """ 
-            数据处理函数: 批量对数据集的制定列进行分词,并在句首添加<s>符号表示起始符bos
-            examples: 
-            例如, Dataset({
-                            features: ['text',...],
-                            num_rows: 2
-                        })
-            return:  {
-                    'input_ids': [[1, 447, 29882, 801], [1, 447, 29882, 801]], 
-                    'attention_mask': [[1, 1, 1, 1], [1, 1, 1, 1]]
-                    }
-            """
-            return tokenizer(examples['text'])
+    tokenizer = load_tokenizer(modelArguments, trainingArguments, logger)
+    if dataArguments.block_size is None:
+        block_size = tokenizer.model_max_length
+    else:
+        block_size = min(dataArguments.block_size, tokenizer.model_max_length)
+    def tokenize_function(examples: datasets.Dataset) -> Dict:
+        """ 
+        数据处理函数: 批量对数据集的制定列进行分词,并在句首添加<s>符号表示起始符bos
+        examples: 
+        例如, Dataset({
+                        features: ['text',...],
+                        num_rows: 2
+                    })
+        return:  {
+                'input_ids': [[1, 447, 29882, 801], [1, 447, 29882, 801]], 
+                'attention_mask': [[1, 1, 1, 1], [1, 1, 1, 1]]
+                }
+        """
+        return tokenizer(examples['text'])
 
-        def group_texts(examples: datasets.Dataset) -> Dict:
-            """
-            数据处理函数: 拼接分词后数据集中的所有文本, 并依据block_size, 生成block块
-            examples: 
-            例如, Dataset({
-                            features: ['input_ids','attention_mask',...],
-                            num_rows: 2
-                        })
-            return: 
-            """
-            # 拼接数据集中同一个特征的所有数据
-            # {'input_ids': [value,...], 'attention_mask': [value,...],....}
-            concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-            total_length = len(concatenated_examples[list(concatenated_examples.keys())[0]])
-            # 丢掉切分后剩余的部分数据
-            if total_length >= block_size:
-                total_length = (total_length // block_size) * block_size
-            # 切分文本块
-            result = {
-                k: [t[i:i+block_size] for i in range(0, total_length, block_size)] 
-                for k,t in concatenated_examples.items()
-            }
-            result['label'] = result["input_ids"].copy()
-            return result
-        # 加载数据
-        if dataArguments.dataset_dir:
-            raw_datasets = load_dataset(path=dataArguments.dataset_dir, name=dataArguments.dataset_subset_name)
-        elif dataArguments.train_file_path and dataArguments.eval_file_path and dataArguments.data_file_type:
-            data_files = {
-                "train": dataArguments.train_file_path,
-                "validation": dataArguments.eval_file_path
-            }
-            raw_datasets = load_dataset(dataArguments.data_file_type, data_files=data_files)
-        else:
-            raise ValueError("请配置 [dataset_dir] or [train_file_path、eval_file_path、test_file_path and data_file_type]")
+    def group_texts(examples: datasets.Dataset) -> Dict:
+        """
+        数据处理函数: 拼接分词后数据集中的所有文本, 并依据block_size, 生成block块
+        examples: 
+        例如, Dataset({
+                        features: ['input_ids','attention_mask',...],
+                        num_rows: 2
+                    })
+        return: 
+        """
+        # 拼接数据集中同一个特征的所有数据
+        # {'input_ids': [value,...], 'attention_mask': [value,...],....}
+        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+        total_length = len(concatenated_examples[list(concatenated_examples.keys())[0]])
+        # 丢掉切分后剩余的部分数据
+        if total_length >= block_size:
+            total_length = (total_length // block_size) * block_size
+        # 切分文本块
+        result = {
+            k: [t[i:i+block_size] for i in range(0, total_length, block_size)] 
+            for k,t in concatenated_examples.items()
+        }
+        result['label'] = result["input_ids"].copy()
+        return result
+    # 加载数据
+    if dataArguments.dataset_dir:
+        raw_datasets = load_dataset(path=dataArguments.dataset_dir, name=dataArguments.dataset_subset_name)
+    elif dataArguments.train_file_path and dataArguments.eval_file_path and dataArguments.data_file_type:
+        data_files = {
+            "train": dataArguments.train_file_path,
+            "validation": dataArguments.eval_file_path
+        }
+        raw_datasets = load_dataset(dataArguments.data_file_type, data_files=data_files)
+    else:
+        raise ValueError("请配置 [dataset_dir] or [train_file_path、eval_file_path、test_file_path and data_file_type]")
 
+    os.makedirs(dataArguments.processed_data_cache_dir, exist_ok=True)
+
+    tokenized_datasets = raw_datasets.map(
+        function=tokenize_function,
+        batched=True,
+        num_proc=dataArguments.preprocessing_num_workers,
+        remove_columns='text',
+        load_from_cache_file=True,
+        keep_in_memory=False,
+        desc='Runing tokenizer on raw dataset',
+    )
+    processed_datasets = tokenized_datasets.map(
+        function=group_texts,
+        batched=True,
+        num_proc=dataArguments.preprocessing_num_workers,
+        load_from_cache_file=True,
+        keep_in_memory=False,
+        desc='Grouping texts in chunks of {block_size}',
+    )
+    if dataArguments.overwrite_cache_processed_dataset:
+        shutil.rmtree(dataArguments.processed_data_cache_dir)
         os.makedirs(dataArguments.processed_data_cache_dir, exist_ok=True)
-
-        tokenized_datasets = raw_datasets.map(
-            function=tokenize_function,
-            batched=True,
-            num_proc=dataArguments.preprocessing_num_workers,
-            remove_columns='text',
-            load_from_cache_file=True,
-            keep_in_memory=False,
-            desc='Runing tokenizer on raw dataset',
-        )
-        processed_datasets = tokenized_datasets.map(
-            function=group_texts,
-            batched=True,
-            num_proc=dataArguments.preprocessing_num_workers,
-            load_from_cache_file=True,
-            keep_in_memory=False,
-            desc='Grouping texts in chunks of {block_size}',
-        )
-        if dataArguments.overwrite_cache_processed_dataset:
-            shutil.rmtree(dataArguments.processed_data_cache_dir)
-            os.makedirs(dataArguments.processed_data_cache_dir, exist_ok=True)
-        processed_datasets.save_to_disk(dataArguments.processed_data_cache_dir)
-        logger.info(f"Local Rank: {trainingArguments.local_rank} 数据预处理完毕......") 
+    processed_datasets.save_to_disk(dataArguments.processed_data_cache_dir)
+    logger.info(f"Local Rank: {trainingArguments.local_rank} 数据预处理完毕......") 
 
 # Step4: 加载数据
 def prepare_dataloader(dataArguments: DataArguments,
@@ -465,6 +450,13 @@ def load_model(modelArguments: ModelArguments,
     logger.info(f"Local Rank: {trainingArguments.local_rank} Llama raw vocab size is {model_vocab_size}")
     logger.info(f"Local Rank: {trainingArguments.local_rank} chinese medical tokenizer vocab size is {len(tokenizer)}")
     logger.info(f"Local Rank: {trainingArguments.local_rank} The vocab embedding has been expanded.")
+    if os.path.exists(trainingArguments.resume_from_checkpoint):
+        logger.info(f'Local Rank: {trainingArguments.local_rank} start loading snapshot')
+        snap_shot = torch.load(trainingArguments.resume_from_checkpoint, map_location='cpu')
+        model.load_state_dict(snap_shot['MODEL_STATE'])
+        trainingArguments.epochs_run = snap_shot['EPOCHS_RUN']
+        trainingArguments.steps_update = snap_shot['STEP']
+        logger.info(f"Local Rank: {trainingArguments.local_rank} Resuming training from snapshot at Epoch {trainingArguments.epochs_run}")
     
     return model
 
@@ -494,8 +486,8 @@ class MyTrainer:
         self.gradient_accumulation_steps = trainingArguments.gradient_accumulation_steps
         self.max_grad_norm = trainingArguments.max_grad_norm
         self.modules_to_train = trainingArguments.modules_to_train
-        self.epochs_run = 0 # 已训练epoch个数
-        self.steps_update = 0 # 已更新参数的次数
+        self.epochs_run = trainingArguments.epochs_run # 已训练epoch个数
+        self.steps_update = trainingArguments.steps_update # 已更新参数的次数
         self.num_train_epochs = trainingArguments.num_train_epochs
         self.train_batch_size = trainingArguments.train_batch_size
         self.eval_batch_size = trainingArguments.eval_batch_size
@@ -513,15 +505,11 @@ class MyTrainer:
         self.compute_metrics = compute_metrics
         # 加载模型
         self.model = model.to(self.gpu_id)
-        if os.path.exists(self.snapshot_path):
-            self.logger.info(f'Local Rank: {self.gpu_id} start loading snapshot')
-            self._load_snapshot(self.snapshot_path)
-            self.logger.info(f"Local Rank: {self.gpu_id} Resuming training from snapshot at Epoch {self.epochs_run}")
         # 动态参数
         self.num_training_steps = self._get_num_training_steps(trainingArguments.max_steps) # 参数最大更新次数
         self.every_epoch_training_steps = len(self.train_dataloader) // self.gradient_accumulation_steps
         self.warmup_steps = trainingArguments.get_warmup_steps(self.num_training_steps)
-        self.training_params = self._get_training_params()
+        self.training_params = self._get_training_params(self.modules_to_train)
         self.num_training_params = self._get_num_params(only_trainable=True, exclude_embeddings=False)
         self.total_num_params = self._get_num_params(only_trainable=False, exclude_embeddings=False)
         self.optimizer, self.scheduler = self._create_optimizer_and_scheduler()
@@ -577,7 +565,7 @@ class MyTrainer:
             if self.gpu_id == 0 and (epoch % self.save_interval_epoch == 0) or (self.steps_update % self.save_steps == 0):
                 self._save_snapshot(epoch)
             # 达到最大更新步数，退出训练
-            if self.steps_update > self.num_training_steps:
+            if self.gpu_id == 0 and self.steps_update > self.num_training_steps:
                 self._save_snapshot(epoch)
                 break
         self.logger.info(f'Local Rank: {self.gpu_id} 训练结束!')
@@ -649,13 +637,6 @@ class MyTrainer:
         content = f'Local Rank: {self.gpu_id} | Epoch {epoch}/{self.num_train_epochs} | Step {self.steps_update}/{self.num_training_steps} | Loss: {loss}'
         self.logger.info(content)
         wandb.log({'training_loss': loss}, step=self.steps_update)
-              
-    def _load_snapshot(self, snapshot_path: str):
-        loc = f'cuda:{self.gpu_id}'
-        snap_shot = torch.load(snapshot_path, map_location=loc)
-        self.model.load_state_dict(snap_shot['MODEL_STATE'])
-        self.epochs_run = snap_shot['EPOCHS_RUN']
-        self.steps_update = snap_shot['STEP']
     
     def _save_snapshot(self, epoch: int):
         snapshot = {
@@ -710,9 +691,9 @@ class MyTrainer:
         max_steps = math.ceil((self.num_train_epochs - self.epochs_run) * num_update_steps_per_epoch)
         return max_steps
     
-    def _get_training_params(self):
+    def _get_training_params(self, modules_to_train: str):
         """ 获取训练参数 """
-        train_modules = self.modules_to_train.strip().split(',')
+        train_modules = modules_to_train.strip().split(',')
         for name, value in self.model.named_parameters():
             if any(module_name in name for module_name in train_modules):
                 value.requires_grad = True
@@ -745,8 +726,9 @@ if __name__ == '__main__':
                         datefmt="%Y/%m/%d %H:%M:%S",
                         level=logging.INFO, 
                         handlers=[logging.StreamHandler(sys.stdout)])
-    # 数据预处理
-    preprocess_dataset(dataArguments, modelArguments, trainingArguments, logger)
+    # 只在主进程中进行数据预处理，同时阻塞其它副本进程
+    with trainingArguments.main_process_first(desc='数据预处理'):
+        preprocess_dataset(dataArguments, modelArguments, trainingArguments, logger)
     # 加载数据
     train_dataloader, eval_dataloader, trainSampler = prepare_dataloader(dataArguments, trainingArguments, logger)
     # 加载模型
