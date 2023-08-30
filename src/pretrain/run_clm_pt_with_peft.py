@@ -223,7 +223,6 @@ class MyTrainingArguments(TrainingArguments):
     lora_dropout: Optional[float] = field(default=0.1, metadata={"help": "The dropout probability for Lora layers"})
     lora_trainable: Optional[str] = field(default="q_proj,v_proj", metadata={"help": "The names of the modules to apply Lora to"})
     modules_to_save : Optional[str] = field(default="embed_tokens,lm_head", metadata={"help": "modules apart from LoRA layers to be set as trainable and saved in the final checkpoint"})
-    peft_save_path : Optional[str] = field(default=None, metadata={"help": "lora adapter保存路径"})
     
 @dataclass
 class WandbArguments:
@@ -443,11 +442,16 @@ def load_model(modelArguments: ModelArguments,
     # 更新配置
     if modelArguments.config_overrides:
         model_config.update_from_string(modelArguments.config_overrides)
+    # 精度
     torch_dtype = (
             modelArguments.torch_dtype
             if modelArguments.torch_dtype in ['auto', None]
             else getattr(torch, modelArguments.torch_dtype)
         )
+    # 如果指定精度为float16或bfloat16则不进行混合精度计算
+    if modelArguments.torch_dtype in ['float16', 'bfloat16']:
+        trainingArguments.use_amp = False
+        
     if modelArguments.model_name_or_path:
         model = LlamaForCausalLM.from_pretrained(
             modelArguments.model_name_or_path,
@@ -468,7 +472,7 @@ def load_model(modelArguments: ModelArguments,
         logger.info(f'Local Rank: {trainingArguments.local_rank} start loading snapshot')
         model = PeftModelForCausalLM.from_pretrained(model=model, 
                                                      model_id=trainingArguments.resume_from_checkpoint,
-                                                     device_map='cpu',
+                                                     device_map={"": "cpu"},
                                                      torch_dtype=torch_dtype)
         with open(trainingArguments.resume_from_checkpoint + "/training_process.json", "r", encoding='utf-8') as fi:
             info = json.load(fi)
@@ -518,7 +522,7 @@ class MyTrainer:
         self.lora_dropout = trainingArguments.lora_dropout
         self.lora_trainable = trainingArguments.lora_trainable
         self.modules_to_save = trainingArguments.modules_to_save
-        self.peft_save_path = trainingArguments.peft_save_path
+        self.output_dir = trainingArguments.output_dir
         
         self.epochs_run = trainingArguments.epochs_run # 已训练epoch个数
         self.steps_update = trainingArguments.steps_update # 已更新参数的次数
@@ -550,7 +554,7 @@ class MyTrainer:
         self.scaler = GradScaler()
         
         # 数据并行
-        self.model = DDP(self.model, device_ids=[self.gpu_id])
+        self.model = DDP(self.model, device_ids=[self.gpu_id], find_unused_parameters=True)
         
         import wandb
         self.wandb = wandbArguments
@@ -596,7 +600,7 @@ class MyTrainer:
     def train(self):
         if self.gpu_id == 0:
             percentage = round(self.num_training_params / self.total_num_params * 100, 2)
-            self.logger.info(f'Training parameters number is {self.num_training_params}, Total parameters number is {self.total_num_params}, accounted for {percentage}%')
+            self.logger.info(f'Training parameters number is {format(self.num_training_params,",d")}, Total parameters number is {format(self.total_num_params, ",d")}, accounted for {percentage}%')
         torch.cuda.empty_cache()
         self.model.train()
         for epoch in trange(1, math.ceil(self.num_train_epochs+1), desc='Epoch', disable=False):
@@ -689,7 +693,7 @@ class MyTrainer:
         wandb.log({'training_loss': loss}, step=self.steps_update)
     
     def _save_snapshot(self, epoch: int):
-        peft_model_dir = os.path.join(self.peft_save_path, "pt_lora_model_epoch_{epoch}_step_{self.steps_update}")
+        peft_model_dir = os.path.join(self.output_dir, f"pt_lora_model_epoch_{epoch}_step_{self.steps_update}")
         os.makedirs(peft_model_dir, exist_ok=True)
         # saves the adapter model and the adapter configuration files to a directory
         self.model.module.save_pretrained(peft_model_dir)
@@ -758,7 +762,7 @@ class MyTrainer:
                 trainable_params += num_params
         return trainable_params, all_param
 
-if __name__ == '__main__':
+def main():
     # 初始化进程组
     ddp_setup()
     # 参数解析
@@ -788,3 +792,6 @@ if __name__ == '__main__':
                         logger=logger)
     trainer.train()
     destroy_process_group()
+    
+if __name__ == '__main__':
+    main()

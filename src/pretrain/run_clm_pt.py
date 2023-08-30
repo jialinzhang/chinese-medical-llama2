@@ -433,6 +433,11 @@ def load_model(modelArguments: ModelArguments,
     # 更新配置
     if modelArguments.config_overrides:
         model_config.update_from_string(modelArguments.config_overrides)
+        
+    # 如果指定精度为float16或bfloat16则不进行混合精度计算
+    if modelArguments.torch_dtype in ['float16', 'bfloat16']:
+        trainingArguments.use_amp = False
+        
     if modelArguments.model_name_or_path:
         torch_dtype = (
             modelArguments.torch_dtype
@@ -564,7 +569,7 @@ class MyTrainer:
     def train(self):
         if self.gpu_id == 0:
             percentage = round(self.num_training_params / self.total_num_params * 100, 2)
-            self.logger.info(f'Training parameters number is {self.num_training_params}, Total parameters number is {self.total_num_params}, accounted for {percentage}%')
+            self.logger.info(f'Training parameters number is {format(self.num_training_params, ",d")}, Total parameters number is {format(self.total_num_params, ",d")}, accounted for {percentage}%')
         torch.cuda.empty_cache()
         self.model.train()
         for epoch in trange(1, math.ceil(self.num_train_epochs+1), desc='Epoch', disable=False):
@@ -732,7 +737,7 @@ class MyTrainer:
         else:
             return sum(p.numel() for p in self.model.parameters() if p.requires_grad or not only_trainable)
 
-if __name__ == '__main__':
+def main():
     # 初始化进程组
     ddp_setup()
     # 参数解析
@@ -762,3 +767,5 @@ if __name__ == '__main__':
                         logger=logger)
     trainer.train()
     destroy_process_group()
+if __name__ == '__main__':
+    main()
