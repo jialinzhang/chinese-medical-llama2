@@ -448,6 +448,7 @@ def load_model(modelArguments: ModelArguments,
             if modelArguments.torch_dtype in ['auto', None]
             else getattr(torch, modelArguments.torch_dtype)
         )
+
     # 如果指定精度为float16或bfloat16则不进行混合精度计算
     if modelArguments.torch_dtype in ['float16', 'bfloat16']:
         trainingArguments.use_amp = False
