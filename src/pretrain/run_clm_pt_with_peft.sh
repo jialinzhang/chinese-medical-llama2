@@ -1,7 +1,7 @@
 # WandbArguments
 team_name=nlp-journey
 project_name=llama2
-experiment_name=only_train_embed_token_and_lm_head
+experiment_name=train_embed_token_and_lm_head_with_peft
 experiment_group=llama2-7b训练
 commit_message=llama2-7b训练
 job_type=training
@@ -16,9 +16,14 @@ tokenizer_name_or_path=../../data/chinese-medical-llama-tokenizer/hf_dir/
 use_auth_token=*****
 torch_dtype=float16
 # TrainingArguments
+lora_rank=8
+lora_alpha=32.
+lora_dropout=0.1
+lora_trainable="q_proj,v_proj,k_proj,o_proj,gate_proj,down_proj,up_proj"
+modules_to_save=embed_tokens,lm_head
+peft_save_path=./output_dir
 use_amp=True
 debug_mode=True
-modules_to_train=embed_tokens,lm_head
 learning_rate=0.0003
 weight_decay=0.1
 adam_beta1=0.9
@@ -28,7 +33,6 @@ max_grad_norm=1.0
 num_train_epochs=1
 lr_scheduler_type=cosine
 warmup_ratio=0.05
-output_dir=./output_dir
 do_train=True
 do_eval=True
 logging_steps=1
@@ -56,9 +60,14 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node 2 --nnodes 1 --node_rank 0 ru
                                --tokenizer_name_or_path ${tokenizer_name_or_path} \
                                --use_auth_token ${use_auth_token} \
                                --torch_dtype ${torch_dtype} \
+                               --lora_rank ${lora_rank} \
+                               --lora_alpha ${lora_alpha} \
+                               --lora_dropout ${lora_dropout} \
+                               --lora_trainable ${lora_trainable} \
+                               --modules_to_save ${modules_to_save} \
+                               --peft_save_path ${peft_save_path} \
                                --use_amp ${use_amp} \
                                --debug_mode ${debug_mode} \
-                               --modules_to_train ${modules_to_train} \
                                --learning_rate ${learning_rate} \
                                --weight_decay ${weight_decay} \
                                --adam_beta1 ${adam_beta1} \
@@ -68,7 +77,6 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node 2 --nnodes 1 --node_rank 0 ru
                                --num_train_epochs ${num_train_epochs} \
                                --lr_scheduler_type ${lr_scheduler_type} \
                                --warmup_ratio ${warmup_ratio} \
-                               --output_dir ${output_dir} \
                                --do_train ${do_train} \
                                --do_eval ${do_eval} \
                                --eval_steps ${eval_steps} \

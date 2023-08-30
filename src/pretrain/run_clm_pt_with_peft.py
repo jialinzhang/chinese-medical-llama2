@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
-# @File: run_clm_pt.py
+# @File: run_clm_pt_with_peft.py
 # @CreateTime: 2023/08/25 14:38:22
 # @WeChat: damo894127201
 # @WeChat Official Accounts: NLP Journey
 # @Huggingface Organizations: NLP Journey
 # @Github: jialinzhang
-# @Instruction: 对LlaMA2-7b进行二次预训练：训练embedding和lm_head层，冻结其它参数
+# @Instruction: 对LlaMA2-7b进行二次预训练：训练embedding和lm_head层，以及lora，并冻结其它参数
 '''
 一、模块结构:
     1、命令行参数类
@@ -25,6 +25,7 @@
 三、训练技术:
     1、数据并行DDP
     2、混合精度AMP
+    3、Lora微调
 '''
 import numpy as np
 import datasets
@@ -44,6 +45,8 @@ from transformers import (
 )
 from transformers.optimization import get_scheduler
 from torch.cuda.amp import autocast, GradScaler
+from peft import get_peft_model, get_peft_model_state_dict, LoraConfig, TaskType
+from peft.peft_model import PeftModelForCausalLM, PeftModel
 from sklearn.metrics import accuracy_score
 import wandb
 
@@ -51,6 +54,7 @@ import sys
 import os
 import math
 import shutil
+import json
 from dataclasses import dataclass, field
 from itertools import chain
 from typing import Optional, Dict, Tuple, List, Callable
@@ -209,11 +213,17 @@ class MyTrainingArguments(TrainingArguments):
     """
     
     debug_mode: Optional[bool] = field(default=False, metadata={"help": ("是否调试模式")})
-    modules_to_train : Optional[str] = field(default=None, metadata={"help": "参与训练的网络层, example: embed_tokens,lm_head"})
     save_interval_epoch: Optional[int] = field(default=1, metadata={"help": "每多少个epoch保存checkpoint"})
     steps_update: Optional[int] = field(default=0, metadata={"help": "参数已更新次数, 用于加载checkpoint中的step"})
     epochs_run: Optional[int] = field(default=0, metadata={"help": "已训练过的epoch次数, 用于加载checkpoint中的epoch"})
     use_amp: Optional[bool] = field(default=False, metadata={"help": "是否启用混合精度"})
+    # Lora
+    lora_rank: Optional[int] = field(default=8, metadata={"help": "Lora矩阵秩"})
+    lora_alpha: Optional[float] = field(default=32., metadata={"help": " The alpha parameter for Lora scaling, real value = lora_alpha / r"})
+    lora_dropout: Optional[float] = field(default=0.1, metadata={"help": "The dropout probability for Lora layers"})
+    lora_trainable: Optional[str] = field(default="q_proj,v_proj", metadata={"help": "The names of the modules to apply Lora to"})
+    modules_to_save : Optional[str] = field(default="embed_tokens,lm_head", metadata={"help": "modules apart from LoRA layers to be set as trainable and saved in the final checkpoint"})
+    peft_save_path : Optional[str] = field(default=None, metadata={"help": "lora adapter保存路径"})
     
 @dataclass
 class WandbArguments:
@@ -433,12 +443,12 @@ def load_model(modelArguments: ModelArguments,
     # 更新配置
     if modelArguments.config_overrides:
         model_config.update_from_string(modelArguments.config_overrides)
-    if modelArguments.model_name_or_path:
-        torch_dtype = (
+    torch_dtype = (
             modelArguments.torch_dtype
             if modelArguments.torch_dtype in ['auto', None]
             else getattr(torch, modelArguments.torch_dtype)
         )
+    if modelArguments.model_name_or_path:
         model = LlamaForCausalLM.from_pretrained(
             modelArguments.model_name_or_path,
             config=model_config,
@@ -456,19 +466,32 @@ def load_model(modelArguments: ModelArguments,
     logger.info(f"Local Rank: {trainingArguments.local_rank} The vocab embedding has been expanded.")
     if os.path.exists(trainingArguments.resume_from_checkpoint):
         logger.info(f'Local Rank: {trainingArguments.local_rank} start loading snapshot')
-        snap_shot = torch.load(trainingArguments.resume_from_checkpoint, map_location='cpu')
-        model.load_state_dict(snap_shot['MODEL_STATE'])
-        trainingArguments.epochs_run = snap_shot['EPOCHS_RUN']
-        trainingArguments.steps_update = snap_shot['STEP']
+        model = PeftModelForCausalLM.from_pretrained(model=model, 
+                                                     model_id=trainingArguments.resume_from_checkpoint,
+                                                     device_map='cpu',
+                                                     torch_dtype=torch_dtype)
+        with open(trainingArguments.resume_from_checkpoint + "/training_process.json", "r", encoding='utf-8') as fi:
+            info = json.load(fi)
+            trainingArguments.epochs_run = info['EPOCHS_RUN']
+            trainingArguments.steps_update = info['STEP']
         logger.info(f"Local Rank: {trainingArguments.local_rank} Resuming training from snapshot at Epoch {trainingArguments.epochs_run}")
-    
+    else:
+        # 创建lora config
+        lora_config = LoraConfig(task_type=TaskType.CAUSAL_LM, 
+                                inference_mode=False, 
+                                r=trainingArguments.lora_rank, 
+                                lora_alpha=trainingArguments.lora_alpha,
+                                lora_dropout=trainingArguments.lora_dropout,
+                                modules_to_save=trainingArguments.modules_to_save.split(','))
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
     return model
 
 # Step6: 构建训练器
 class MyTrainer:
     """ 自定义训练器 """
     def __init__(self,
-                 model: torch.nn.Module,
+                 model: PeftModelForCausalLM,
                  train_dataloader: DataLoader,
                  eval_dataloader: DataLoader,
                  trainSampler: DistributedSampler,
@@ -489,14 +512,20 @@ class MyTrainer:
         # 每多少个batch进行梯度更新
         self.gradient_accumulation_steps = trainingArguments.gradient_accumulation_steps
         self.max_grad_norm = trainingArguments.max_grad_norm
-        self.modules_to_train = trainingArguments.modules_to_train
+        # lora
+        self.lora_rank = trainingArguments.lora_rank
+        self.lora_alpha = trainingArguments.lora_alpha
+        self.lora_dropout = trainingArguments.lora_dropout
+        self.lora_trainable = trainingArguments.lora_trainable
+        self.modules_to_save = trainingArguments.modules_to_save
+        self.peft_save_path = trainingArguments.peft_save_path
+        
         self.epochs_run = trainingArguments.epochs_run # 已训练epoch个数
         self.steps_update = trainingArguments.steps_update # 已更新参数的次数
         self.num_train_epochs = trainingArguments.num_train_epochs
         self.train_batch_size = trainingArguments.train_batch_size
         self.eval_batch_size = trainingArguments.eval_batch_size
         self.snapshot_path = trainingArguments.resume_from_checkpoint
-        self.output_dir = trainingArguments.output_dir
         self.save_steps = trainingArguments.save_steps
         self.save_interval_epoch = trainingArguments.save_interval_epoch
         # 采用梯度累积时，指代参数更新的次数
@@ -513,9 +542,8 @@ class MyTrainer:
         self.num_training_steps = self._get_num_training_steps(trainingArguments.max_steps) # 参数最大更新次数
         self.every_epoch_training_steps = len(self.train_dataloader) // self.gradient_accumulation_steps
         self.warmup_steps = trainingArguments.get_warmup_steps(self.num_training_steps)
-        self.training_params = self._get_training_params(self.modules_to_train)
-        self.num_training_params = self._get_num_params(only_trainable=True, exclude_embeddings=False)
-        self.total_num_params = self._get_num_params(only_trainable=False, exclude_embeddings=False)
+        self.training_params = self._get_training_params()
+        self.num_training_params, self.total_num_params = self._get_num_params()
         self.optimizer, self.scheduler = self._create_optimizer_and_scheduler()
         # 混合精度训练
         self.use_amp = trainingArguments.use_amp
@@ -540,7 +568,11 @@ class MyTrainer:
             'warmup_steps': self.warmup_steps,
             'num_training_epochs': self.num_train_epochs,
             'num_training_steps': self.num_training_steps,
-            'modules_to_train': self.modules_to_train,
+            'lora_rank': self.lora_rank,
+            'lora_alpha': self.lora_alpha,
+            'lora_dropout': self.lora_dropout,
+            'lora_trainable': self.lora_trainable,
+            'modules_to_save': self.modules_to_save,
             'max_grad_norm': self.max_grad_norm,
             'gradient_accumulation_steps': self.max_grad_norm,
             'train_batch_size': self.train_batch_size,
@@ -657,15 +689,15 @@ class MyTrainer:
         wandb.log({'training_loss': loss}, step=self.steps_update)
     
     def _save_snapshot(self, epoch: int):
-        snapshot = {
-            "MODEL_STATE": self.model.module.state_dict(),
-            "EPOCHS_RUN": epoch,
-            "STEP": self.steps_update
-        }
-        os.makedirs(self.output_dir, exist_ok=True)
-        save_path = os.path.join(self.output_dir, f"pytorch_model_epoch_{epoch}_step_{self.steps_update}.bin")
-        torch.save(snapshot, f'{save_path}')
-        self.logger.info(f'Local Rank: {self.gpu_id} Epoch {epoch} STEP {self.steps_update}| Training snapshot saved at {save_path}')
+        peft_model_dir = os.path.join(self.peft_save_path, "pt_lora_model_epoch_{epoch}_step_{self.steps_update}")
+        os.makedirs(peft_model_dir, exist_ok=True)
+        # saves the adapter model and the adapter configuration files to a directory
+        self.model.module.save_pretrained(peft_model_dir)
+        # 保存训练进度
+        with open(peft_model_dir + "/training_process.json", "w", encoding="utf-8") as fo:
+            info = {"EPOCHS_RUN": self.epochs_run, "STEP": self.steps_update}
+            json.dump(info, fo, indent=4, ensure_ascii=False)
+        self.logger.info(f'Local Rank: {self.gpu_id} Epoch {epoch} STEP {self.steps_update}| Training snapshot saved at {peft_model_dir}')
     
     def _create_optimizer_and_scheduler(self):
         optimizer = self._create_optimizer()
@@ -709,28 +741,22 @@ class MyTrainer:
         max_steps = math.ceil((self.num_train_epochs - self.epochs_run) * num_update_steps_per_epoch)
         return max_steps
     
-    def _get_training_params(self, modules_to_train: str):
+    def _get_training_params(self):
         """ 获取训练参数 """
-        train_modules = modules_to_train.strip().split(',')
-        for name, value in self.model.named_parameters():
-            if any(module_name in name for module_name in train_modules):
-                value.requires_grad = True
-                continue
-            value.requires_grad = False
         return list(filter(lambda item:item[1].requires_grad, self.model.named_parameters()))
     
-    def _get_num_params(self, only_trainable: bool = False, exclude_embeddings: bool = False) -> int:
-        """ 获取参数数量"""
-        if exclude_embeddings:
-            embedding_param_names = [
-                f"{name}.weight" for name, module_type in self.model.named_modules() if isinstance(module_type, torch.nn.Embedding)
-            ]
-            non_embedding_parameters = [
-                parameter for name, parameter in self.model.named_parameters() if name not in embedding_param_names
-            ]
-            return sum(p.numel() for p in non_embedding_parameters if p.requires_grad or not only_trainable)
-        else:
-            return sum(p.numel() for p in self.model.parameters() if p.requires_grad or not only_trainable)
+    def _get_num_params(self) -> int:
+        """ 获取训练参数和总参数数量 参照 peft.peft_model.PeftModel.print_trainable_parameters"""
+        trainable_params, all_param = 0, 0
+        for _, param in self.model.named_parameters():
+            num_params = param.numel()
+            # if using DS Zero 3 and the weights are initialized empty
+            if num_params == 0 and hasattr(param, "ds_numel"):
+                num_params = param.ds_numel
+            all_param += num_params
+            if param.requires_grad:
+                trainable_params += num_params
+        return trainable_params, all_param
 
 if __name__ == '__main__':
     # 初始化进程组
