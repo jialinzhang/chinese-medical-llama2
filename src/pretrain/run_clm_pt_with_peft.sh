@@ -21,7 +21,6 @@ lora_alpha=32.
 lora_dropout=0.1
 lora_trainable="q_proj,v_proj,k_proj,o_proj,gate_proj,down_proj,up_proj"
 modules_to_save=embed_tokens,lm_head
-peft_save_path=./output_dir
 use_amp=True
 debug_mode=True
 learning_rate=0.0003
@@ -42,10 +41,11 @@ save_interval_epoch=1
 per_device_train_batch_size=1
 per_device_eval_batch_size=1
 gradient_accumulation_steps=8
+output_dir=./output_dir
 resume_from_checkpoint=./output_dir
 
 
-CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node 2 --nnodes 1 --node_rank 0 run_clm_pt.py \
+CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node 2 --nnodes 1 --node_rank 0 run_clm_pt_with_peft.py \
                                --team_name ${team_name} \
                                --project_name ${project_name} \
                                --experiment_name ${experiment_name} \
@@ -65,7 +65,6 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node 2 --nnodes 1 --node_rank 0 ru
                                --lora_dropout ${lora_dropout} \
                                --lora_trainable ${lora_trainable} \
                                --modules_to_save ${modules_to_save} \
-                               --peft_save_path ${peft_save_path} \
                                --use_amp ${use_amp} \
                                --debug_mode ${debug_mode} \
                                --learning_rate ${learning_rate} \
@@ -86,4 +85,5 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node 2 --nnodes 1 --node_rank 0 ru
                                --per_device_train_batch_size ${per_device_train_batch_size} \
                                --per_device_eval_batch_size ${per_device_eval_batch_size} \
                                --gradient_accumulation_steps ${gradient_accumulation_steps} \
+                               --output_dir ${output_dir} \
                                --resume_from_checkpoint ${resume_from_checkpoint}
