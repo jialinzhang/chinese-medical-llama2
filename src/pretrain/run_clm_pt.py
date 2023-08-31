@@ -612,13 +612,13 @@ class MyTrainer:
             # 当经过梯度累积步数个batch后，进行参数更新
             if (batch_index + 1) % self.gradient_accumulation_steps == 0:
                 self._update_params()
-                cur_loss = 0
                 self.steps_update += 1 # 记录参数更新次数
                 if self.gpu_id == 0:
                     if self.steps_update % self.logging_steps == 0:
                         self._log_training_info(epoch, cur_loss)
                     if self.steps_update % self.eval_steps == 0:
                         self.evaluate(epoch)
+                cur_loss = 0
             # 达到最大更新步数，退出训练
             if self.steps_update > self.num_training_steps:
                 break
