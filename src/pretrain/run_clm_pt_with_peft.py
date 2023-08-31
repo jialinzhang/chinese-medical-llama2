@@ -169,7 +169,7 @@ class ModelArguments:
     torch_dtype: Optional[str] = field(
         default=None,
         metadata={
-            "help": ("覆盖默认的“torch.dtype”并在此dtype下加载模型。如果传递“auto”，则“dtype“将自动从模型的权重中得出"),
+            "help": ("覆盖默认的“torch.dtype”并在此dtype下加载模型。如果传递“auto”,则“dtype“将自动从模型的权重中得出"),
             "choices": ["auto", "bfloat16", "float16", "float32"],
         },
     )
@@ -447,7 +447,7 @@ def load_model(modelArguments: ModelArguments,
             modelArguments.torch_dtype
             if modelArguments.torch_dtype in ['auto', None]
             else getattr(torch, modelArguments.torch_dtype)
-        )
+    )
 
     # 如果指定精度为float16或bfloat16则不进行混合精度计算
     if modelArguments.torch_dtype in ['float16', 'bfloat16']:
