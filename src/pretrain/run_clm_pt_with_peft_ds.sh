@@ -28,7 +28,7 @@ output_dir=./output_dir
 resume_from_checkpoint=./output_dir
 
 
-CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node 2 --nnodes 1 --node_rank 0 run_clm_pt_with_peft_ds.py \
+deepspeed --num_gpus=2 --num_nodes=1 run_clm_pt_with_peft_ds.py \
                                --dataset_dir ${dataset_dir} \
                                --dataset_subset_name ${dataset_subset_name} \
                                --block_size ${block_size} \

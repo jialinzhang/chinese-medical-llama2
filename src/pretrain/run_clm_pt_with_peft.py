@@ -416,12 +416,12 @@ def prepare_dataloader(dataArguments: DataArguments,
         
     train_sampler = DistributedSampler(dataset=train_dataset)
     train_dataloader = DataLoader(dataset=train_dataset, 
-                                  batch_size=trainingArguments.train_batch_size, 
+                                  batch_size=trainingArguments.per_device_train_batch_size, 
                                   sampler=train_sampler,
                                   collate_fn=collate_fn,
                                   drop_last=True)
     eval_dataloader = DataLoader(dataset=eval_dataset, 
-                                 batch_size=trainingArguments.eval_batch_size,
+                                 batch_size=trainingArguments.per_device_eval_batch_size,
                                  collate_fn=collate_fn,
                                  drop_last=False)
     
@@ -528,7 +528,8 @@ class MyTrainer:
         self.epochs_run = trainingArguments.epochs_run # 已训练epoch个数
         self.steps_update = trainingArguments.steps_update # 已更新参数的次数
         self.num_train_epochs = trainingArguments.num_train_epochs
-        self.train_batch_size = trainingArguments.train_batch_size
+        # batch_size = per_device_train_batch_size * n_gpus * gradient_accumulation_steps
+        self.train_batch_size = trainingArguments.train_batch_size * trainingArguments.gradient_accumulation_steps
         self.eval_batch_size = trainingArguments.eval_batch_size
         self.snapshot_path = trainingArguments.resume_from_checkpoint
         self.save_steps = trainingArguments.save_steps
