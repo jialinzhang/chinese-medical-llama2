@@ -400,9 +400,9 @@ def prepare_dataloader(dataArguments: DataArguments,
             batch_input_ids.append(item['input_ids'])
             batch_attention_mask.append(item['attention_mask'])
             batch_label.append(item['label'])
-        batch_input_ids = torch.tensor(batch_input_ids).cuda(trainingArguments.local_rank)
-        batch_attention_mask = torch.tensor(batch_attention_mask).cuda(trainingArguments.local_rank)
-        batch_label = torch.tensor(batch_label).cuda(trainingArguments.local_rank)
+        batch_input_ids = torch.tensor(batch_input_ids)
+        batch_attention_mask = torch.tensor(batch_attention_mask)
+        batch_label = torch.tensor(batch_label)
         return batch_input_ids, batch_attention_mask, batch_label
         
     train_sampler = DistributedSampler(dataset=train_dataset)
@@ -591,6 +591,7 @@ class MyTrainer:
         avg_loss = 0
         for step, batch in enumerate(self.eval_dataloader):
             batch_input_ids, batch_attention_mask, batch_label = batch
+            batch_input_ids, batch_attention_mask, batch_label = batch_input_ids.cuda(self.gpu_id), batch_attention_mask.cuda(self.gpu_id), batch_label.cuda(self.gpu_id)
             outputs = self.model(input_ids=batch_input_ids, attention_mask=batch_attention_mask, labels=batch_label)
             loss, logits = outputs[0].item(), outputs[1].cpu()
             batch_label = batch_label.cpu()
@@ -626,6 +627,7 @@ class MyTrainer:
                      
     def _run_batch(self, batch):
         batch_input_ids, batch_attention_mask, batch_label = batch
+        batch_input_ids, batch_attention_mask, batch_label = batch_input_ids.cuda(self.gpu_id), batch_attention_mask.cuda(self.gpu_id), batch_label.cuda(self.gpu_id)
         if self.use_amp:
             with autocast():
                 outputs = self.model(input_ids=batch_input_ids, attention_mask=batch_attention_mask, labels=batch_label)
