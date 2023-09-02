@@ -373,9 +373,9 @@ def prepare_dataloader(dataArguments: DataArguments,
             batch_input_ids.append(item['input_ids'])
             batch_attention_mask.append(item['attention_mask'])
             batch_label.append(item['label'])
-        batch_input_ids = torch.tensor(batch_input_ids).cuda(trainingArguments.local_rank)
-        batch_attention_mask = torch.tensor(batch_attention_mask).cuda(trainingArguments.local_rank)
-        batch_label = torch.tensor(batch_label).cuda(trainingArguments.local_rank)
+        batch_input_ids = torch.tensor(batch_input_ids)
+        batch_attention_mask = torch.tensor(batch_attention_mask)
+        batch_label = torch.tensor(batch_label)
         return batch_input_ids, batch_attention_mask, batch_label
     
      # 加载deepspeed配置
@@ -456,7 +456,7 @@ def load_model(modelArguments: ModelArguments,
                                 lora_dropout=trainingArguments.lora_dropout,
                                 modules_to_save=trainingArguments.modules_to_save.split(','))
         model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
+
     return model
 
 # Step6: 构建训练器
@@ -535,6 +535,7 @@ class MyTrainer:
         avg_loss = 0
         for step, batch in enumerate(self.eval_dataloader):
             batch_input_ids, batch_attention_mask, batch_label = batch
+            batch_input_ids, batch_attention_mask, batch_label = batch_input_ids.cuda(self.gpu_id), batch_attention_mask.cuda(self.gpu_id), batch_label.cuda(self.gpu_id)
             outputs = self.model(input_ids=batch_input_ids, attention_mask=batch_attention_mask, labels=batch_label)
             loss, logits = outputs[0].item(), outputs[1].cpu()
             batch_label = batch_label.cpu()
@@ -564,12 +565,13 @@ class MyTrainer:
                      
     def _run_batch(self, batch):
         batch_input_ids, batch_attention_mask, batch_label = batch
+        batch_input_ids, batch_attention_mask, batch_label = batch_input_ids.cuda(self.gpu_id), batch_attention_mask.cuda(self.gpu_id), batch_label.cuda(self.gpu_id)
         outputs = self.model(input_ids=batch_input_ids, attention_mask=batch_attention_mask, labels=batch_label)
         loss = outputs[0]
         loss.requires_grad_(True)
-        # 计算梯度值
-        self.model.backward(loss)
-        # 参数更新/学习率调整/梯度累积
+        # 计算梯度值/梯度累积
+        loss = self.model.backward(loss)
+        # 参数更新/学习率调整
         self.model.step()
         return loss.item()
         
@@ -599,7 +601,7 @@ class MyTrainer:
     
     def _get_training_params(self):
         """ 获取训练参数 """
-        return list(filter(lambda item:item[1].requires_grad, self.model.named_parameters()))
+        return [p for n,p in filter(lambda item:item[1].requires_grad, self.model.named_parameters())]
     
     def _get_num_params(self) -> int:
         """ 获取训练参数和总参数数量 参照 peft.peft_model.PeftModel.print_trainable_parameters"""

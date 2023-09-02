@@ -13,7 +13,7 @@ processed_data_cache_dir=./processed
 # ModelArguments
 model_name_or_path=meta-llama/Llama-2-7b-hf
 tokenizer_name_or_path=../../data/chinese-medical-llama-tokenizer/hf_dir/
-use_auth_token=*****
+use_auth_token=your_huggingface_access_token
 torch_dtype=float16
 # TrainingArguments
 use_amp=True
