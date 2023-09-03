@@ -22,7 +22,7 @@ lora_dropout=0.1
 lora_trainable="q_proj,v_proj,k_proj,o_proj,gate_proj,down_proj,up_proj"
 modules_to_save=embed_tokens,lm_head
 use_amp=True
-debug_mode=True
+debug_mode=False
 learning_rate=0.0003
 weight_decay=0.1
 adam_beta1=0.9
@@ -34,10 +34,9 @@ lr_scheduler_type=cosine
 warmup_ratio=0.05
 do_train=True
 do_eval=True
-logging_steps=1
-eval_steps=1
-save_steps=10
-save_interval_epoch=1
+logging_steps=100
+eval_steps=10000
+save_steps=10000
 per_device_train_batch_size=1
 per_device_eval_batch_size=1
 gradient_accumulation_steps=8
@@ -80,7 +79,6 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node 2 --nnodes 1 --node_rank 0 ru
                                --do_eval ${do_eval} \
                                --eval_steps ${eval_steps} \
                                --save_steps ${save_steps} \
-                               --save_interval_epoch ${save_interval_epoch} \
                                --logging_steps ${logging_steps} \
                                --per_device_train_batch_size ${per_device_train_batch_size} \
                                --per_device_eval_batch_size ${per_device_eval_batch_size} \

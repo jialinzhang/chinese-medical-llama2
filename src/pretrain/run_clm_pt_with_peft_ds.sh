@@ -14,16 +14,15 @@ lora_alpha=32.
 lora_dropout=0.1
 lora_trainable="q_proj,v_proj,k_proj,o_proj,gate_proj,down_proj,up_proj"
 modules_to_save=embed_tokens,lm_head
-debug_mode=True
+debug_mode=False
 deepspeed_config=./ds_config.json
-max_steps=100 # 参数最大更新次数
+max_steps=20000 # 参数最大更新次数
 num_train_epochs=1
 do_train=True
 do_eval=True
-logging_steps=1
-eval_steps=1
-save_steps=10
-save_interval_epoch=1
+logging_steps=100
+eval_steps=10000
+save_steps=10000
 output_dir=./output_dir
 resume_from_checkpoint=./output_dir
 
@@ -51,6 +50,5 @@ deepspeed --num_gpus=2 --num_nodes=1 run_clm_pt_with_peft_ds.py \
                                --logging_steps ${logging_steps} \
                                --eval_steps ${eval_steps} \
                                --save_steps ${save_steps} \
-                               --save_interval_epoch ${save_interval_epoch} \
                                --output_dir ${output_dir} \
                                --resume_from_checkpoint ${resume_from_checkpoint}

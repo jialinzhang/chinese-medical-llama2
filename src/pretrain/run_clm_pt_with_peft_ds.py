@@ -209,7 +209,6 @@ class MyTrainingArguments(TrainingArguments):
     
     """
     debug_mode: Optional[bool] = field(default=False, metadata={"help": ("是否调试模式")})
-    save_interval_epoch: Optional[int] = field(default=1, metadata={"help": "每多少个epoch保存checkpoint"})
     steps_update: Optional[int] = field(default=0, metadata={"help": "参数已更新次数, 用于加载checkpoint中的step"})
     epochs_run: Optional[int] = field(default=0, metadata={"help": "已训练过的epoch次数, 用于加载checkpoint中的epoch"})
     # Lora
@@ -501,7 +500,6 @@ class MyTrainer:
         self.gradient_accumulation_steps = trainingArguments.gradient_accumulation_steps
         self.snapshot_path = trainingArguments.resume_from_checkpoint
         self.save_steps = trainingArguments.save_steps
-        self.save_interval_epoch = trainingArguments.save_interval_epoch
         
         # 采用梯度累积时，指代参数更新的次数
         self.eval_steps = trainingArguments.eval_steps
@@ -578,7 +576,7 @@ class MyTrainer:
                     self.evaluate(epoch)
                 # 只在主进程中保存模型，同时阻塞其它副本进程
                 if self.gpu_id == 0:
-                    if (epoch % self.save_interval_epoch == 0) or (self.steps_update % self.save_steps == 0):
+                    if self.steps_update % self.save_steps == 0:
                         self._save_snapshot(epoch)
                     torch.distributed.barrier()
                 else:
