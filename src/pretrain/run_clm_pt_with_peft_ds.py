@@ -495,6 +495,7 @@ class MyTrainer:
         
         self.epochs_run = trainingArguments.epochs_run # 已训练epoch个数
         self.steps_update = trainingArguments.steps_update # 已更新参数的次数
+        self.batchs_update = 0 # 已更新的batch个数
         
         self.num_train_epochs = trainingArguments.num_train_epochs
         self.gradient_accumulation_steps = trainingArguments.gradient_accumulation_steps
@@ -528,7 +529,7 @@ class MyTrainer:
             self.logger.info(f'Training parameters number is {format(self.num_training_params,",d")}, Total parameters number is {format(self.total_num_params, ",d")}, accounted for {percentage}%')
         self.model.module.train()
         torch.cuda.empty_cache()
-        for epoch in trange(1, math.ceil(self.num_train_epochs+1), desc='Epoch', disable=False):
+        for epoch in trange(math.ceil(self.num_train_epochs), desc='Epoch', disable=False):
             self._run_epoch(epoch)
             # 达到最大更新步数，退出训练
             if self.steps_update > self.num_training_steps:
@@ -561,30 +562,28 @@ class MyTrainer:
             metric, avg_loss = metric.mean().item() / self.n_gpus, avg_loss.mean().item() / self.n_gpus
             metric, avg_loss = metric / (step + 1), avg_loss / (step + 1)    
             self.logger.info(f'Local Rank: {self.gpu_id} Evaluate Epoch: {epoch}/{self.num_train_epochs} Step: {self.steps_update} Metric: {metric} Eval Loss: {avg_loss}')
-            # 记录至wandb
-            summary_events = [("eval_loss", avg_loss, self.steps_update), ("accuracy", metric, self.steps_update)]
-            self.model.monitor.write_events(summary_events)
     
     def _run_epoch(self, epoch: int):
         self.trainSampler.set_epoch(epoch)
         cur_loss = 0
-        for batch_index, batch in enumerate(self.train_dataloader):
+        for batch in self.train_dataloader:
             loss = self._run_batch(batch)
             cur_loss += loss
-            if (batch_index + 1) % self.gradient_accumulation_steps == 0:
+            if (self.batchs_update + 1) % self.gradient_accumulation_steps == 0:
                 self.steps_update += 1 # 记录参数更新次数
                 if self.gpu_id == 0 and self.steps_update % self.logging_steps == 0:
                     self._log_training_info(epoch, cur_loss)
                 cur_loss = 0
-            if self.steps_update % self.eval_steps == 0:
-                self.evaluate(epoch)
-            # 只在主进程中保存模型，同时阻塞其它副本进程
-            if self.gpu_id == 0:
-                if (epoch % self.save_interval_epoch == 0) or (self.steps_update % self.save_steps == 0):
-                    self._save_snapshot(epoch)
-                torch.distributed.barrier()
-            else:
-                torch.distributed.barrier()
+                if self.steps_update % self.eval_steps == 0:
+                    self.evaluate(epoch)
+                # 只在主进程中保存模型，同时阻塞其它副本进程
+                if self.gpu_id == 0:
+                    if (epoch % self.save_interval_epoch == 0) or (self.steps_update % self.save_steps == 0):
+                        self._save_snapshot(epoch)
+                    torch.distributed.barrier()
+                else:
+                    torch.distributed.barrier()
+            self.batchs_update += 1 # 记录batch更新个数
             # 达到最大更新步数，退出训练，并保存最后模型
             if self.steps_update > self.num_training_steps:
                 break

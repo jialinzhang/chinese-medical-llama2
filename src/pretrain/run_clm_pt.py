@@ -500,6 +500,7 @@ class MyTrainer:
         self.modules_to_train = trainingArguments.modules_to_train
         self.epochs_run = trainingArguments.epochs_run # 已训练epoch个数
         self.steps_update = trainingArguments.steps_update # 已更新参数的次数
+        self.batchs_update = 0 # 已更新的batch个数
         self.num_train_epochs = trainingArguments.num_train_epochs
         # batch_size = per_device_train_batch_size * n_gpus * gradient_accumulation_steps
         self.train_batch_size = trainingArguments.train_batch_size * trainingArguments.gradient_accumulation_steps
@@ -576,7 +577,7 @@ class MyTrainer:
             self.logger.info(f'Training parameters number is {format(self.num_training_params, ",d")}, Total parameters number is {format(self.total_num_params, ",d")}, accounted for {percentage}%')
         torch.cuda.empty_cache()
         self.model.train()
-        for epoch in trange(1, math.ceil(self.num_train_epochs+1), desc='Epoch', disable=False):
+        for epoch in trange(math.ceil(self.num_train_epochs), desc='Epoch', disable=False):
             self._run_epoch(epoch)
             # 达到最大更新步数，退出训练
             if self.steps_update > self.num_training_steps:
@@ -609,33 +610,32 @@ class MyTrainer:
             metric, avg_loss = metric.mean().item() / self.n_gpus, avg_loss.mean().item() / self.n_gpus
             metric, avg_loss = metric / (step + 1), avg_loss / (step + 1)    
             self.logger.info(f'Local Rank: {self.gpu_id} Evaluate Epoch: {epoch}/{self.num_train_epochs} Step: {self.steps_update} Metric: {metric} Eval Loss: {avg_loss}')
-            wandb.log({"eval_loss": avg_loss}, step=self.steps_update)
-            wandb.log({"eval_accuracy": metric}, step=self.steps_update)
     
     def _run_epoch(self, epoch: int):
         self.trainSampler.set_epoch(epoch)
         self.optimizer.zero_grad()
         # 在梯度累积步数内的损失
         cur_loss = 0
-        for batch_index, batch in enumerate(self.train_dataloader):
+        for batch in self.train_dataloader:
             loss = self._run_batch(batch)
             cur_loss += loss
             # 当经过梯度累积步数个batch后，进行参数更新
-            if (batch_index + 1) % self.gradient_accumulation_steps == 0:
+            if (self.batchs_update + 1) % self.gradient_accumulation_steps == 0:
                 self._update_params()
                 self.steps_update += 1 # 记录参数更新次数
                 if self.gpu_id == 0 and self.steps_update % self.logging_steps == 0:
                     self._log_training_info(epoch, cur_loss)
                 cur_loss = 0
-            if self.steps_update % self.eval_steps == 0:
-                self.evaluate(epoch)
-            # 只在主进程中保存模型，同时阻塞其它副本进程
-            if self.gpu_id == 0:
-                if (epoch % self.save_interval_epoch == 0) or (self.steps_update % self.save_steps == 0):
-                    self._save_snapshot(epoch)
-                torch.distributed.barrier()
-            else:
-                torch.distributed.barrier()
+                if self.steps_update % self.eval_steps == 0:
+                    self.evaluate(epoch)
+                # 只在主进程中保存模型，同时阻塞其它副本进程
+                if self.gpu_id == 0:
+                    if (epoch % self.save_interval_epoch == 0) or (self.steps_update % self.save_steps == 0):
+                        self._save_snapshot(epoch)
+                    torch.distributed.barrier()
+                else:
+                    torch.distributed.barrier()
+            self.batchs_update += 1 # 记录batch更新个数
             # 达到最大更新步数，退出训练
             if self.steps_update > self.num_training_steps:
                 break
@@ -677,7 +677,7 @@ class MyTrainer:
     def _log_training_info(self, epoch:int, loss: float):
         content = f'Local Rank: {self.gpu_id} | Epoch {epoch}/{self.num_train_epochs} | Step {self.steps_update}/{self.num_training_steps} | Loss: {loss}'
         self.logger.info(content)
-        wandb.log({'training_loss': loss}, step=self.steps_update)
+        wandb.log({'training_loss': loss}, step=self.batchs_update)
     
     def _save_snapshot(self, epoch: int):
         snapshot = {
