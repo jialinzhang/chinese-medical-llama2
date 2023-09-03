@@ -33,6 +33,7 @@ from datasets import load_dataset, load_from_disk
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from torch.distributed.distributed_c10d import ReduceOp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import transformers
@@ -299,6 +300,10 @@ def ddp_setup():
     init_process_group(backend="nccl", init_method="env://")
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
+def read_json(path: str):
+    with open(path, "r", encoding="utf-8") as fi:
+        return json.load(fi)
+
 # Step3: 数据预处理
 def preprocess_dataset(dataArguments: DataArguments,
                        modelArguments: ModelArguments,
@@ -415,6 +420,7 @@ def prepare_dataloader(dataArguments: DataArguments,
         return batch_input_ids, batch_attention_mask, batch_label
         
     train_sampler = DistributedSampler(dataset=train_dataset)
+    eval_sampler = DistributedSampler(dataset=eval_dataset)
     train_dataloader = DataLoader(dataset=train_dataset, 
                                   batch_size=trainingArguments.per_device_train_batch_size, 
                                   sampler=train_sampler,
@@ -422,6 +428,7 @@ def prepare_dataloader(dataArguments: DataArguments,
                                   drop_last=True)
     eval_dataloader = DataLoader(dataset=eval_dataset, 
                                  batch_size=trainingArguments.per_device_eval_batch_size,
+                                 sampler=eval_sampler,
                                  collate_fn=collate_fn,
                                  drop_last=False)
     
@@ -475,10 +482,9 @@ def load_model(modelArguments: ModelArguments,
                                                      model_id=trainingArguments.resume_from_checkpoint,
                                                      device_map={"": "cpu"},
                                                      torch_dtype=torch_dtype)
-        with open(trainingArguments.resume_from_checkpoint + "/training_process.json", "r", encoding='utf-8') as fi:
-            info = json.load(fi)
-            trainingArguments.epochs_run = info['EPOCHS_RUN']
-            trainingArguments.steps_update = info['STEP']
+        info = read_json(trainingArguments.resume_from_checkpoint + "/training_process.json")
+        trainingArguments.epochs_run = info['EPOCHS_RUN']
+        trainingArguments.steps_update = info['STEP']
         logger.info(f"Local Rank: {trainingArguments.local_rank} Resuming training from snapshot at Epoch {trainingArguments.epochs_run}")
     else:
         # 创建lora config
@@ -607,12 +613,12 @@ class MyTrainer:
         self.model.train()
         for epoch in trange(1, math.ceil(self.num_train_epochs+1), desc='Epoch', disable=False):
             self._run_epoch(epoch)
-            if self.gpu_id == 0 and (epoch % self.save_interval_epoch == 0) or (self.steps_update % self.save_steps == 0):
-                self._save_snapshot(epoch)
             # 达到最大更新步数，退出训练
-            if self.gpu_id == 0 and self.steps_update > self.num_training_steps:
-                self._save_snapshot(epoch)
+            if self.steps_update > self.num_training_steps:
                 break
+        # 保存最终模型
+        if self.gpu_id in [-1, 0]:
+            self._save_snapshot(epoch)
         self.logger.info(f'Local Rank: {self.gpu_id} 训练结束!')
     
     @torch.no_grad()
@@ -630,10 +636,16 @@ class MyTrainer:
             metric += self.compute_metrics(logits.argmax(dim=-1), batch_label)['accuracy']
             avg_loss += loss
         self.model.train()
-        metric, avg_loss = metric / (step + 1), avg_loss / (step + 1)
-        self.logger.info(f'Local Rank: {self.gpu_id} Evaluate Epoch: {epoch}/{self.num_train_epochs} Step: {self.steps_update} Metric: {metric} Eval Loss: {avg_loss}')
-        wandb.log({"eval_loss": avg_loss}, step=self.steps_update)
-        wandb.log({"eval_accuracy": metric}, step=self.steps_update)
+        metric, avg_loss = torch.tensor(metric).cuda(self.gpu_id), torch.tensor(avg_loss).cuda(self.gpu_id)
+        # 聚合所有进程中的值到rank=0
+        torch.distributed.reduce(tensor=metric, dst=0, op=ReduceOp.SUM)
+        torch.distributed.reduce(tensor=avg_loss, dst=0, op=ReduceOp.SUM)
+        if self.gpu_id == 0:
+            metric, avg_loss = metric.mean().item() / self.n_gpus, avg_loss.mean().item() / self.n_gpus
+            metric, avg_loss = metric / (step + 1), avg_loss / (step + 1)    
+            self.logger.info(f'Local Rank: {self.gpu_id} Evaluate Epoch: {epoch}/{self.num_train_epochs} Step: {self.steps_update} Metric: {metric} Eval Loss: {avg_loss}')
+            wandb.log({"eval_loss": avg_loss}, step=self.steps_update)
+            wandb.log({"eval_accuracy": metric}, step=self.steps_update)
     
     def _run_epoch(self, epoch: int):
         self.trainSampler.set_epoch(epoch)
@@ -647,12 +659,18 @@ class MyTrainer:
             if (batch_index + 1) % self.gradient_accumulation_steps == 0:
                 self._update_params()
                 self.steps_update += 1 # 记录参数更新次数
-                if self.gpu_id == 0:
-                    if self.steps_update % self.logging_steps == 0:
-                        self._log_training_info(epoch, cur_loss)
-                    if self.steps_update % self.eval_steps == 0:
-                        self.evaluate(epoch)
+                if self.gpu_id == 0 and self.steps_update % self.logging_steps == 0:
+                    self._log_training_info(epoch, cur_loss)
                 cur_loss = 0
+            if self.steps_update % self.eval_steps == 0:
+                self.evaluate(epoch)
+            # 只在主进程中保存模型，同时阻塞其它副本进程
+            if self.gpu_id == 0:
+                if (epoch % self.save_interval_epoch == 0) or (self.steps_update % self.save_steps == 0):
+                    self._save_snapshot(epoch)
+                torch.distributed.barrier()
+            else:
+                torch.distributed.barrier()
             # 达到最大更新步数，退出训练
             if self.steps_update > self.num_training_steps:
                 break
@@ -779,8 +797,11 @@ def main():
                         level=logging.INFO, 
                         handlers=[logging.StreamHandler(sys.stdout)])
     # 只在主进程中进行数据预处理，同时阻塞其它副本进程
-    with trainingArguments.main_process_first(desc='数据预处理'):
+    if trainingArguments.local_rank == 0:
         preprocess_dataset(dataArguments, modelArguments, trainingArguments, logger)
+        torch.distributed.barrier()
+    else:
+        torch.distributed.barrier()
     # 加载数据
     train_dataloader, eval_dataloader, trainSampler = prepare_dataloader(dataArguments, trainingArguments, logger)
     # 加载模型
