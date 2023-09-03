@@ -259,7 +259,7 @@ def load_tokenizer(modelArguments: ModelArguments,
 @contextmanager
 def torch_distributed_zero_first(rank: int):
     """ Decorator to make all processes in distributed training wait for each local_master to do something """
-    if rank not in [-1, 0]:
+    if rank != 0:
         torch.distributed.barrier()
     yield
     if rank == 0:
