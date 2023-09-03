@@ -34,7 +34,7 @@ from datasets import load_dataset, load_from_disk
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.distributed_c10d import ReduceOp
 import transformers
 from transformers import (
     TrainingArguments,
@@ -54,6 +54,7 @@ import math
 import shutil
 import json
 from dataclasses import dataclass, field
+from contextlib import contextmanager
 from itertools import chain
 from typing import Optional, Dict, Tuple, List, Callable
 from tqdm import trange
@@ -254,7 +255,17 @@ def load_tokenizer(modelArguments: ModelArguments,
         return LlamaTokenizer.from_pretrained(modelArguments.tokenizer_name_or_path, **tokenizer_kwargs)
     else:
         raise ValueError(f"Local Rank: {trainingArguments.local_rank} 请配置分词器名称或路径: tokenizer_name_or_path")
- 
+
+@contextmanager
+def torch_distributed_zero_first(rank: int):
+    """ Decorator to make all processes in distributed training wait for each local_master to do something """
+    if rank not in [-1, 0]:
+        torch.distributed.barrier()
+    yield
+    if rank == 0:
+        torch.distributed.barrier()
+
+
 def deepspeed_setup():
     deepspeed.init_distributed(dist_backend="nccl", init_method="env://")
 
@@ -386,6 +397,7 @@ def prepare_dataloader(dataArguments: DataArguments,
     trainingArguments.gradient_accumulation_steps = deepspeed_config["gradient_accumulation_steps"]
         
     train_sampler = DistributedSampler(dataset=train_dataset)
+    eval_sampler = DistributedSampler(dataset=eval_dataset)
     train_dataloader = DataLoader(dataset=train_dataset, 
                                   batch_size=trainingArguments.per_device_train_batch_size, 
                                   sampler=train_sampler,
@@ -393,6 +405,7 @@ def prepare_dataloader(dataArguments: DataArguments,
                                   drop_last=True)
     eval_dataloader = DataLoader(dataset=eval_dataset, 
                                  batch_size=trainingArguments.per_device_eval_batch_size,
+                                 sampler=eval_sampler,
                                  collate_fn=collate_fn,
                                  drop_last=False)
     
@@ -528,7 +541,7 @@ class MyTrainer:
         self.logger.info(f'Local Rank: {self.gpu_id} 训练结束!')
     
     @torch.no_grad()
-    def evaluate(self, epoch: int):
+    def evaluate(self):
         self.logger.info(f'Local Rank: {self.gpu_id} 开始评测...')
         self.model.module.eval()
         metric = 0
@@ -542,8 +555,18 @@ class MyTrainer:
             metric += self.compute_metrics(logits.argmax(dim=-1), batch_label)['accuracy']
             avg_loss += loss
         self.model.module.train()
-        metric, avg_loss = metric / (step + 1), avg_loss / (step + 1)
-        self.logger.info(f'Local Rank: {self.gpu_id} Evaluate Epoch: {epoch}/{self.num_train_epochs} Step: {self.steps_update} Metric: {metric} Eval Loss: {avg_loss}')
+        self.logger.info(f"rank:{self.gpu_id}, before reduce metric: {metric}, avg_loss: {avg_loss}")
+        metric, avg_loss = torch.tensor(metric).cuda(self.gpu_id), torch.tensor(avg_loss).cuda(self.gpu_id)
+        # 聚合所有进程中的值到rank=0
+        torch.distributed.reduce(tensor=metric, dst=0, op=ReduceOp.SUM)
+        torch.distributed.reduce(tensor=avg_loss, dst=0, op=ReduceOp.SUM)
+        self.logger.info(f"rank:{self.gpu_id}, after reduce metric: {metric}, avg_loss: {avg_loss}")
+        if self.gpu_id == 0:
+            metric, avg_loss = metric.mean().item() / self.n_gpus, avg_loss.mean().item() / self.n_gpus
+        else:
+            metric, avg_loss = metric.item(), avg_loss.item()
+        
+        return metric / (step + 1), avg_loss / (step + 1)
     
     def _run_epoch(self, epoch: int):
         self.trainSampler.set_epoch(epoch)
@@ -553,11 +576,12 @@ class MyTrainer:
             cur_loss += loss
             if (batch_index + 1) % self.gradient_accumulation_steps == 0:
                 self.steps_update += 1 # 记录参数更新次数
-                if self.gpu_id == 0:
-                    if self.steps_update % self.logging_steps == 0:
-                        self._log_training_info(epoch, cur_loss)
-                    if self.steps_update % self.eval_steps == 0:
-                        self.evaluate(epoch)
+                if self.gpu_id == 0 and self.steps_update % self.logging_steps == 0:
+                    self._log_training_info(epoch, cur_loss)
+                if self.steps_update % self.eval_steps == 0:
+                    metric, avg_loss = self.evaluate()
+                    if self.gpu_id == 0:
+                        self.logger.info(f'Local Rank: {self.gpu_id} Evaluate Epoch: {epoch}/{self.num_train_epochs} Step: {self.steps_update} Metric: {metric} Eval Loss: {avg_loss}')
                 cur_loss = 0
             # 达到最大更新步数，退出训练
             if self.steps_update > self.num_training_steps:
@@ -629,7 +653,7 @@ def main():
                         level=logging.INFO, 
                         handlers=[logging.StreamHandler(sys.stdout)])
     # 只在主进程中进行数据预处理，同时阻塞其它副本进程
-    with trainingArguments.main_process_first(desc='数据预处理'):
+    with torch_distributed_zero_first(trainingArguments.local_rank):
         preprocess_dataset(dataArguments, modelArguments, trainingArguments, logger)
     # 加载数据
     train_dataloader, eval_dataloader, trainSampler = prepare_dataloader(dataArguments, trainingArguments, logger)
