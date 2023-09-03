@@ -515,7 +515,7 @@ class MyTrainer:
         if self.gpu_id == 0:
             percentage = round(self.num_training_params / self.total_num_params * 100, 2)
             self.logger.info(f'Training parameters number is {format(self.num_training_params,",d")}, Total parameters number is {format(self.total_num_params, ",d")}, accounted for {percentage}%')
-        self.model.train()
+        self.model.module.train()
         torch.cuda.empty_cache()
         for epoch in trange(1, math.ceil(self.num_train_epochs+1), desc='Epoch', disable=False):
             self._run_epoch(epoch)
@@ -530,7 +530,7 @@ class MyTrainer:
     @torch.no_grad()
     def evaluate(self, epoch: int):
         self.logger.info(f'Local Rank: {self.gpu_id} 开始评测...')
-        self.model.eval()
+        self.model.module.eval()
         metric = 0
         avg_loss = 0
         for step, batch in enumerate(self.eval_dataloader):
@@ -541,7 +541,7 @@ class MyTrainer:
             batch_label = batch_label.cpu()
             metric += self.compute_metrics(logits.argmax(dim=-1), batch_label)['accuracy']
             avg_loss += loss
-        self.model.train()
+        self.model.module.train()
         metric, avg_loss = metric / (step + 1), avg_loss / (step + 1)
         self.logger.info(f'Local Rank: {self.gpu_id} Evaluate Epoch: {epoch}/{self.num_train_epochs} Step: {self.steps_update} Metric: {metric} Eval Loss: {avg_loss}')
     
