@@ -272,7 +272,8 @@ def compute_metrics(y_pred: np.ndarray, y_true: np.ndarray):
  
 def load_tokenizer(modelArguments: ModelArguments,
                    trainingArguments: MyTrainingArguments,
-                   logger: logging.RootLogger) -> LlamaTokenizer:
+                   logger: logging.RootLogger,
+                   logger_name: str) -> LlamaTokenizer:
     tokenizer_kwargs = {
         "cache_dir": modelArguments.cache_dir,
         "use_fast": modelArguments.use_fast_tokenizer,
@@ -281,10 +282,10 @@ def load_tokenizer(modelArguments: ModelArguments,
     }
     
     if modelArguments.tokenizer_name_or_path:
-        logger.info(f"Local Rank: {trainingArguments.local_rank} 分词器加载成功......")
+        logger.info(f"Local Rank: {trainingArguments.local_rank} {logger_name} 分词器加载成功......")
         return LlamaTokenizer.from_pretrained(modelArguments.tokenizer_name_or_path, **tokenizer_kwargs)
     else:
-        raise ValueError(f"Local Rank: {trainingArguments.local_rank} 请配置分词器名称或路径: tokenizer_name_or_path")
+        raise ValueError(f"Local Rank: {trainingArguments.local_rank} {logger_name} 请配置分词器名称或路径: tokenizer_name_or_path")
  
 def ddp_setup():
     init_process_group(backend="nccl", init_method="env://")
@@ -295,7 +296,7 @@ def preprocess_dataset(dataArguments: DataArguments,
                        modelArguments: ModelArguments,
                        trainingArguments: MyTrainingArguments,
                        logger: logging.RootLogger):
-    tokenizer = load_tokenizer(modelArguments, trainingArguments, logger)
+    tokenizer = load_tokenizer(modelArguments, trainingArguments, logger, logger_name='preprocess_dataset')
     if dataArguments.block_size is None:
         block_size = tokenizer.model_max_length
     else:
@@ -424,7 +425,7 @@ def prepare_dataloader(dataArguments: DataArguments,
 def load_model(modelArguments: ModelArguments,
                trainingArguments: MyTrainingArguments, 
                logger: logging.RootLogger) -> LlamaForCausalLM:
-    tokenizer = load_tokenizer(modelArguments, trainingArguments, logger)
+    tokenizer = load_tokenizer(modelArguments, trainingArguments, logger, logger_name='load_model')
     model_config_kwargs = {
         "cache_dir": modelArguments.cache_dir,
         "revision": modelArguments.model_revision,
