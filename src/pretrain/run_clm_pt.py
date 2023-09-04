@@ -211,7 +211,6 @@ class MyTrainingArguments(TrainingArguments):
     
     debug_mode: Optional[bool] = field(default=False, metadata={"help": ("是否调试模式")})
     modules_to_train : Optional[str] = field(default=None, metadata={"help": "参与训练的网络层, example: embed_tokens,lm_head"})
-    save_interval_epoch: Optional[int] = field(default=1, metadata={"help": "每多少个epoch保存checkpoint"})
     steps_update: Optional[int] = field(default=0, metadata={"help": "参数已更新次数, 用于加载checkpoint中的step"})
     epochs_run: Optional[int] = field(default=0, metadata={"help": "已训练过的epoch次数, 用于加载checkpoint中的epoch"})
     use_amp: Optional[bool] = field(default=False, metadata={"help": "是否启用混合精度"})
@@ -508,7 +507,6 @@ class MyTrainer:
         self.snapshot_path = trainingArguments.resume_from_checkpoint
         self.output_dir = trainingArguments.output_dir
         self.save_steps = trainingArguments.save_steps
-        self.save_interval_epoch = trainingArguments.save_interval_epoch
         # 采用梯度累积时，指代参数更新的次数
         self.eval_steps = trainingArguments.eval_steps
         self.logging_steps = trainingArguments.logging_steps
@@ -630,7 +628,7 @@ class MyTrainer:
                     self.evaluate(epoch)
                 # 只在主进程中保存模型，同时阻塞其它副本进程
                 if self.gpu_id == 0:
-                    if (epoch % self.save_interval_epoch == 0) or (self.steps_update % self.save_steps == 0):
+                    if self.steps_update % self.save_steps == 0:
                         self._save_snapshot(epoch)
                     torch.distributed.barrier()
                 else:
