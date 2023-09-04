@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
-# @File: run_clm_pt_with_peft_ds.py
+# @File: run_clm_sft_with_peft_ds.py
 # @CreateTime: 2023/08/25 14:38:22
 # @WeChat: damo894127201
 # @WeChat Official Accounts: NLP Journey
 # @Huggingface Organizations: NLP Journey
 # @Github: jialinzhang
-# @Instruction: 对LlaMA2-7b进行二次预训练：训练embedding和lm_head层，以及lora，并冻结其它参数
+# @Instruction: 对LlaMA2-7b进行指令微调：训练embedding和lm_head层，以及lora，并冻结其它参数
 '''
 一、模块结构:
     1、命令行参数类
@@ -91,12 +91,11 @@ class DataArguments:
         default=10, metadata={"help": ("通过截断验证集，来控制参与验证的数据量，常用于调试或快速训练")}
     )
 
-    block_size: Optional[int] = field(
+    max_seq_length: Optional[int] = field(
         default=None,
         metadata={
             "help": (
-                "词元化后(tokenization)的输入序列的长度"
-                "由于样本之间有长有短, 为了加速训练, 训练样本常被拼接到一个block中"
+                "词元化后(tokenization)的输入序列的最大长度"
                 "默认取值为模型最大支持的单个序列长度(特殊符号也涵盖)"
             )
         },
@@ -272,19 +271,30 @@ def read_json(path: str):
     with open(path, "r", encoding="utf-8") as fi:
         return json.load(fi)
 
+IGNORE_INDEX = 100 # padding id 交叉墒函数在计算损失时会忽略掉该位置的logit
+
+PROMPT_TEMPLATE = (
+    "下面是一条说明任务的指令。"
+    "写出一个能适当完成请求的回复。\n\n"
+    "### 指令：\n{instruction}\n\n### 回复："
+)
+
 # Step3: 数据预处理
 def preprocess_dataset(dataArguments: DataArguments,
                        modelArguments: ModelArguments,
                        trainingArguments: MyTrainingArguments,
                        logger: logging.RootLogger):
     tokenizer = load_tokenizer(modelArguments, trainingArguments, logger, logger_name='preprocess_dataset')
-    if dataArguments.block_size is None:
-        block_size = tokenizer.model_max_length
+    if dataArguments.max_seq_length is None:
+        max_seq_length = tokenizer.model_max_length
     else:
-        block_size = min(dataArguments.block_size, tokenizer.model_max_length)
+        max_seq_length = min(dataArguments.max_seq_length, tokenizer.model_max_length)
     def tokenize_function(examples: datasets.Dataset) -> Dict:
         """ 
-        数据处理函数: 批量对数据集的制定列进行分词,并在句首添加<s>符号表示起始符bos
+        数据处理函数: 
+            1、拼接instruction, input, output 字段内容,并在output字段句尾添加</s>符号表示终止符eos
+            2、对拼接后的内容进行分词, 并基于允许的序列最大长度进行截断
+            3、对instruction和input 部分对应的label进行mask(原始token id 用特殊index替代), 确保其不参与loss计算
         examples: 
         例如, Dataset({
                         features: ['text',...],
@@ -295,32 +305,27 @@ def preprocess_dataset(dataArguments: DataArguments,
                 'attention_mask': [[1, 1, 1, 1], [1, 1, 1, 1]]
                 }
         """
-        return tokenizer(examples['text'])
+        sources, targets, prompt = [], [], PROMPT_TEMPLATE
+        for instruction, input_, output in zip(examples['instruction'], examples['input'], examples['output']):
+            if input_ is not None and input_ != "":
+                instruction = instruction + '\n' + input_
+            source = prompt.format_map({'instruction': instruction})
+            target = f"{output}{tokenizer.eos_token}"
+            sources.append(source)
+            targets.append(target)
+        tokenized_sources = tokenizer(sources, return_attention_mask=False)
+        tokenized_targets = tokenizer(targets, return_attention_mask=False, add_special_tokens=False)
+        # 拼接source 和 target
+        all_input_ids, all_labels = [], []
+        for s, t in zip(tokenized_sources['input_ids'], tokenized_targets['input_ids']):
+            input_ids = torch.LongTensor(s + t)[:max_seq_length]
+            # 将 source 对应的位置遮蔽掉，不进行loss计算，仅计算target部分的loss
+            labels = torch.LongTensor([IGNORE_INDEX] * len(s) + t)[:max_seq_length]
+            assert len(input_ids) == len(labels)
+            all_input_ids.append(input_ids)
+            all_labels.append(labels)
+        return {'input_ids': all_input_ids, 'labels': labels}
 
-    def group_texts(examples: datasets.Dataset) -> Dict:
-        """
-        数据处理函数: 拼接分词后数据集中的所有文本, 并依据block_size, 生成block块
-        examples: 
-        例如, Dataset({
-                        features: ['input_ids','attention_mask',...],
-                        num_rows: 2
-                    })
-        return: 
-        """
-        # 拼接数据集中同一个特征的所有数据
-        # {'input_ids': [value,...], 'attention_mask': [value,...],....}
-        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-        total_length = len(concatenated_examples[list(concatenated_examples.keys())[0]])
-        # 丢掉切分后剩余的部分数据
-        if total_length >= block_size:
-            total_length = (total_length // block_size) * block_size
-        # 切分文本块
-        result = {
-            k: [t[i:i+block_size] for i in range(0, total_length, block_size)] 
-            for k,t in concatenated_examples.items()
-        }
-        result['label'] = result["input_ids"].copy()
-        return result
     # 加载数据
     if dataArguments.dataset_dir:
         raw_datasets = load_dataset(path=dataArguments.dataset_dir, name=dataArguments.dataset_subset_name)
@@ -335,22 +340,14 @@ def preprocess_dataset(dataArguments: DataArguments,
 
     os.makedirs(dataArguments.processed_data_cache_dir, exist_ok=True)
 
-    tokenized_datasets = raw_datasets.map(
+    processed_datasets = raw_datasets.map(
         function=tokenize_function,
         batched=True,
         num_proc=dataArguments.preprocessing_num_workers,
-        remove_columns='text',
+        remove_columns=['instruction', 'input', 'output'],
         load_from_cache_file=True,
         keep_in_memory=False,
-        desc='Runing tokenizer on raw dataset',
-    )
-    processed_datasets = tokenized_datasets.map(
-        function=group_texts,
-        batched=True,
-        num_proc=dataArguments.preprocessing_num_workers,
-        load_from_cache_file=True,
-        keep_in_memory=False,
-        desc='Grouping texts in chunks of {block_size}',
+        desc='preprocessing on dataset',
     )
     if dataArguments.overwrite_cache_processed_dataset:
         shutil.rmtree(dataArguments.processed_data_cache_dir)
@@ -360,8 +357,10 @@ def preprocess_dataset(dataArguments: DataArguments,
 
 # Step4: 加载数据
 def prepare_dataloader(dataArguments: DataArguments,
+                       modelArguments: ModelArguments,
                        trainingArguments: MyTrainingArguments,
                        logger: logging.RootLogger) -> Tuple[DataLoader]:
+    tokenizer = load_tokenizer(modelArguments, trainingArguments, logger, logger_name='prepare_dataloader')
     processed_datasets = load_from_disk(dataArguments.processed_data_cache_dir)
     
     if trainingArguments.do_train:
@@ -378,14 +377,14 @@ def prepare_dataloader(dataArguments: DataArguments,
         logger.info(f"Local Rank: {trainingArguments.local_rank} Num eval_samples  {len(eval_dataset)}")
     
     def collate_fn(batch: List[Dict]):
-        batch_input_ids, batch_attention_mask, batch_label = [], [], []
-        for item in batch:
-            batch_input_ids.append(item['input_ids'])
-            batch_attention_mask.append(item['attention_mask'])
-            batch_label.append(item['label'])
-        batch_input_ids = torch.tensor(batch_input_ids)
-        batch_attention_mask = torch.tensor(batch_attention_mask)
-        batch_label = torch.tensor(batch_label)
+        batch_input_ids, batch_label = tuple([instance[key] for instance in batch for key in ['input_ids', 'labels']])
+        batch_input_ids = torch.nn.utils.rnn.pad_sequence(
+            sequences=batch_input_ids, batch_first=True, padding_value=tokenizer.pad_token_id
+        )
+        batch_label = torch.nn.utils.rnn.pad_sequence(
+            sequences=batch_label, batch_first=True, padding_value=IGNORE_INDEX
+        )
+        batch_attention_mask = batch_input_ids.ne(tokenizer.pad_token_id)
         return batch_input_ids, batch_attention_mask, batch_label
     
      # 加载deepspeed配置
@@ -659,7 +658,7 @@ def main():
     else:
         torch.distributed.barrier()
     # 加载数据
-    train_dataloader, eval_dataloader, trainSampler = prepare_dataloader(dataArguments, trainingArguments, logger)
+    train_dataloader, eval_dataloader, trainSampler = prepare_dataloader(dataArguments, modelArguments, trainingArguments, logger)
     # 加载模型
     model = load_model(modelArguments, trainingArguments, logger)
     # 构建训练器
