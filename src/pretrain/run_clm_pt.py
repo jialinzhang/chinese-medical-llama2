@@ -333,6 +333,7 @@ def preprocess_dataset(dataArguments: DataArguments,
         # 丢掉切分后剩余的部分数据
         if total_length >= block_size:
             total_length = (total_length // block_size) * block_size
+        logger.info(f'rank:{trainingArguments.local_rank} preprocessed dataset num is {total_length}')
         # 切分文本块
         result = {
             k: [t[i:i+block_size] for i in range(0, total_length, block_size)] 
@@ -502,6 +503,8 @@ class MyTrainer:
         self.steps_update = trainingArguments.steps_update # 已更新参数的次数
         self.batchs_update = 0 # 已更新的batch个数
         self.num_train_epochs = trainingArguments.num_train_epochs
+        self.global_samples = 0 # 全局已训练的数据量
+        self.batch_update_global_sample = trainingArguments.train_batch_size # 每迭代一个batch的数据量
         # batch_size = per_device_train_batch_size * n_gpus * gradient_accumulation_steps
         self.train_batch_size = trainingArguments.train_batch_size * trainingArguments.gradient_accumulation_steps
         self.eval_batch_size = trainingArguments.eval_batch_size
@@ -609,6 +612,8 @@ class MyTrainer:
             metric, avg_loss = metric.mean().item() / self.n_gpus, avg_loss.mean().item() / self.n_gpus
             metric, avg_loss = metric / (step + 1), avg_loss / (step + 1)    
             self.logger.info(f'Local Rank: {self.gpu_id} Evaluate Epoch: {epoch}/{self.num_train_epochs} Step: {self.steps_update} Metric: {metric} Eval Loss: {avg_loss}')
+            wandb.log({'Eval/Samples/eval_loss', avg_loss}, step=self.global_samples)
+            wandb.log({'Eval/Samples/accuracy', metric}, step=self.global_samples)
     
     def _run_epoch(self, epoch: int):
         self.trainSampler.set_epoch(epoch)
@@ -635,6 +640,7 @@ class MyTrainer:
                 else:
                     torch.distributed.barrier()
             self.batchs_update += 1 # 记录batch更新个数
+            self.global_samples += self.batch_update_global_sample # 记录全局已训练的数据量
             # 达到最大更新步数，退出训练
             if self.steps_update > self.num_training_steps:
                 break
@@ -676,7 +682,7 @@ class MyTrainer:
     def _log_training_info(self, epoch:int, loss: float):
         content = f'Local Rank: {self.gpu_id} | Epoch {epoch}/{self.num_train_epochs} | Step {self.steps_update}/{self.num_training_steps} | Loss: {loss}'
         self.logger.info(content)
-        wandb.log({'training_loss': loss}, step=self.batchs_update)
+        wandb.log({'Train/Samples/train_loss': loss}, step=self.global_samples)
     
     def _save_snapshot(self, epoch: int):
         snapshot = {
