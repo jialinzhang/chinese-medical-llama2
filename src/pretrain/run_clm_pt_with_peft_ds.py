@@ -314,6 +314,7 @@ def preprocess_dataset(dataArguments: DataArguments,
         # 丢掉切分后剩余的部分数据
         if total_length >= block_size:
             total_length = (total_length // block_size) * block_size
+        logger.info(f'rank:{trainingArguments.local_rank} preprocessed dataset num is {total_length}')
         # 切分文本块
         result = {
             k: [t[i:i+block_size] for i in range(0, total_length, block_size)] 
@@ -363,7 +364,6 @@ def prepare_dataloader(dataArguments: DataArguments,
                        trainingArguments: MyTrainingArguments,
                        logger: logging.RootLogger) -> Tuple[DataLoader]:
     processed_datasets = load_from_disk(dataArguments.processed_data_cache_dir)
-    
     if trainingArguments.do_train:
         train_dataset = processed_datasets['train']
     if trainingArguments.do_eval:
@@ -561,6 +561,8 @@ class MyTrainer:
             metric, avg_loss = metric.mean().item() / self.n_gpus, avg_loss.mean().item() / self.n_gpus
             metric, avg_loss = metric / (step + 1), avg_loss / (step + 1)    
             self.logger.info(f'Local Rank: {self.gpu_id} Evaluate Epoch: {epoch}/{self.num_train_epochs} Step: {self.steps_update} Metric: {metric} Eval Loss: {avg_loss}')
+            summary_events = [('Eval/Samples/eval_loss', avg_loss, self.model.global_samples), ('Eval/Samples/accuracy', metric, self.model.global_samples)]
+            self.model.monitor.write_events(summary_events)
     
     def _run_epoch(self, epoch: int):
         self.trainSampler.set_epoch(epoch)
