@@ -324,6 +324,7 @@ def preprocess_dataset(dataArguments: DataArguments,
             assert len(input_ids) == len(labels)
             all_input_ids.append(input_ids)
             all_labels.append(labels)
+        logger.info(f'rank:{trainingArguments.local_rank} preprocessed dataset num is {len(all_input_ids)}')
         return {'input_ids': all_input_ids, 'labels': labels}
 
     # 加载数据
@@ -560,6 +561,8 @@ class MyTrainer:
             metric, avg_loss = metric.mean().item() / self.n_gpus, avg_loss.mean().item() / self.n_gpus
             metric, avg_loss = metric / (step + 1), avg_loss / (step + 1)    
             self.logger.info(f'Local Rank: {self.gpu_id} Evaluate Epoch: {epoch}/{self.num_train_epochs} Step: {self.steps_update} Metric: {metric} Eval Loss: {avg_loss}')
+            summary_events = [('Eval/Samples/eval_loss', avg_loss, self.model.global_samples), ('Eval/Samples/accuracy', metric, self.model.global_samples)]
+            self.model.monitor.write_events(summary_events)
     
     def _run_epoch(self, epoch: int):
         self.trainSampler.set_epoch(epoch)
