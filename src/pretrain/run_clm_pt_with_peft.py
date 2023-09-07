@@ -489,14 +489,15 @@ def load_model(modelArguments: ModelArguments,
         logger.info(f"Local Rank: {trainingArguments.local_rank} Resuming training from snapshot at Epoch {trainingArguments.epochs_run}")
     else:
         # 创建lora config
-        target_modules = trainingArguments.lora_trainable.split(",")
+        target_modules = trainingArguments.lora_trainable.strip().split(",")
+        modules_to_save = trainingArguments.modules_to_save.strip().split(',')
         lora_config = LoraConfig(task_type=TaskType.CAUSAL_LM, 
                                  target_modules=target_modules,
                                  inference_mode=False, 
                                  r=trainingArguments.lora_rank, 
                                  lora_alpha=trainingArguments.lora_alpha,
                                  lora_dropout=trainingArguments.lora_dropout,
-                                 modules_to_save=trainingArguments.modules_to_save.split(','))
+                                 modules_to_save=modules_to_save)
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
     return model

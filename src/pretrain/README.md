@@ -60,4 +60,5 @@
 - 每个进程都拥有完整的数据集，`torch.utils.data.distribued.DistributedSampler`用于给他们分配数据的`index`，避免数据传输
 
 **预训练结果**
-...
+- 训练Llama2的embed_tokens、lm_head和LoRA层q_proj和v_proj，lora adapter存储位置：data/lora_adapter/q_proj_v_proj_embed_tokens_lm_head
+  <img src='../../pic/pretrain/q_proj_v_proj_embed_tokens_lm_head.png'>
