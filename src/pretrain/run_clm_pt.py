@@ -42,6 +42,7 @@ from transformers import (
     LlamaConfig,
     LlamaTokenizer,
     LlamaForCausalLM,
+    set_seed
 )
 from transformers.optimization import get_scheduler
 from torch.cuda.amp import autocast, GradScaler
@@ -376,6 +377,10 @@ def preprocess_dataset(dataArguments: DataArguments,
         shutil.rmtree(dataArguments.processed_data_cache_dir)
         os.makedirs(dataArguments.processed_data_cache_dir, exist_ok=True)
     processed_datasets.save_to_disk(dataArguments.processed_data_cache_dir)
+    
+    logger.info(f"rank:{trainingArguments.local_rank} the num of preprocessed train dataset is {processed_datasets['train'].num_rows}")
+    logger.info(f"rank:{trainingArguments.local_rank} the num of preprocessed eval dataset is {processed_datasets['validation'].num_rows}")
+    logger.info(f"rank:{trainingArguments.local_rank} the num of preprocessed test dataset is {processed_datasets['test'].num_rows}")
     logger.info(f"Local Rank: {trainingArguments.local_rank} 数据预处理完毕......") 
 
 # Step4: 加载数据
@@ -441,6 +446,9 @@ def load_model(modelArguments: ModelArguments,
     # 如果指定精度为float16或bfloat16则不进行混合精度计算
     if modelArguments.torch_dtype in ['float16', 'bfloat16']:
         trainingArguments.use_amp = False
+        
+    # 设置随机种子
+    set_seed(trainingArguments.seed)
         
     if modelArguments.model_name_or_path:
         torch_dtype = (
