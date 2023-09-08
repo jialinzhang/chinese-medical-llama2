@@ -1,0 +1,40 @@
+2023-09-08 10:51:49,330 INFO    MainThread:9618 [wandb_setup.py:_flush():76] Configure stats pid to 9618
+2023-09-08 10:51:49,330 INFO    MainThread:9618 [wandb_setup.py:_flush():76] Loading settings from /Users/zhangjialin/.config/wandb/settings
+2023-09-08 10:51:49,330 INFO    MainThread:9618 [wandb_setup.py:_flush():76] Loading settings from /Users/zhangjialin/Documents/项目/myProject/chinese-medical-llama2/wandb/settings
+2023-09-08 10:51:49,330 INFO    MainThread:9618 [wandb_setup.py:_flush():76] Loading settings from environment variables: {}
+2023-09-08 10:51:49,330 INFO    MainThread:9618 [wandb_setup.py:_flush():76] Applying setup settings: {'_disable_service': False}
+2023-09-08 10:51:49,330 INFO    MainThread:9618 [wandb_setup.py:_flush():76] Inferring run settings from compute environment: {'program': '<python with no main file>'}
+2023-09-08 10:51:49,331 INFO    MainThread:9618 [wandb_init.py:_log_setup():507] Logging user logs to /Users/zhangjialin/Documents/项目/myProject/chinese-medical-llama2/wandb/run-20230908_105149-hqcp02k0/logs/debug.log
+2023-09-08 10:51:49,331 INFO    MainThread:9618 [wandb_init.py:_log_setup():508] Logging internal logs to /Users/zhangjialin/Documents/项目/myProject/chinese-medical-llama2/wandb/run-20230908_105149-hqcp02k0/logs/debug-internal.log
+2023-09-08 10:51:49,331 INFO    MainThread:9618 [wandb_init.py:_jupyter_setup():453] configuring jupyter hooks <wandb.sdk.wandb_init._WandbInit object at 0x7ff49876b1f0>
+2023-09-08 10:51:49,331 INFO    MainThread:9618 [wandb_init.py:init():547] calling init triggers
+2023-09-08 10:51:49,331 INFO    MainThread:9618 [wandb_init.py:init():554] wandb.init called with sweep_config: {}
+config: {}
+2023-09-08 10:51:49,331 INFO    MainThread:9618 [wandb_init.py:init():595] starting backend
+2023-09-08 10:51:49,331 INFO    MainThread:9618 [wandb_init.py:init():599] setting up manager
+2023-09-08 10:51:49,339 INFO    MainThread:9618 [backend.py:_multiprocessing_setup():106] multiprocessing start_methods=spawn,fork,forkserver, using: spawn
+2023-09-08 10:51:49,344 INFO    MainThread:9618 [wandb_init.py:init():605] backend started and connected
+2023-09-08 10:51:49,348 INFO    MainThread:9618 [wandb_run.py:_label_probe_notebook():1237] probe notebook
+2023-09-08 10:51:49,348 INFO    MainThread:9618 [wandb_run.py:_label_probe_notebook():1247] Unable to probe notebook: 'NoneType' object has no attribute 'get'
+2023-09-08 10:51:49,348 INFO    MainThread:9618 [wandb_init.py:init():695] updated telemetry
+2023-09-08 10:51:49,391 INFO    MainThread:9618 [wandb_init.py:init():732] communicating run to backend with 60.0 second timeout
+2023-09-08 10:51:50,184 INFO    MainThread:9618 [wandb_run.py:_on_init():2176] communicating current version
+2023-09-08 10:51:53,566 INFO    MainThread:9618 [wandb_run.py:_on_init():2185] got version response 
+2023-09-08 10:51:53,567 INFO    MainThread:9618 [wandb_init.py:init():782] starting run threads in backend
+2023-09-08 10:51:57,323 INFO    MainThread:9618 [wandb_run.py:_console_start():2157] atexit reg
+2023-09-08 10:51:57,323 INFO    MainThread:9618 [wandb_run.py:_redirect():2012] redirect: SettingsConsole.WRAP_RAW
+2023-09-08 10:51:57,323 INFO    MainThread:9618 [wandb_run.py:_redirect():2077] Wrapping output streams.
+2023-09-08 10:51:57,323 INFO    MainThread:9618 [wandb_run.py:_redirect():2102] Redirects installed.
+2023-09-08 10:51:57,324 INFO    MainThread:9618 [wandb_init.py:init():824] run started, returning control to user process
+2023-09-08 10:51:57,329 INFO    MainThread:9618 [jupyter.py:save_ipynb():373] not saving jupyter notebook
+2023-09-08 10:51:57,329 INFO    MainThread:9618 [wandb_init.py:_pause_backend():418] pausing backend
+2023-09-08 10:53:51,283 INFO    MainThread:9618 [wandb_init.py:_resume_backend():423] resuming backend
+2023-09-08 10:53:51,293 INFO    MainThread:9618 [jupyter.py:save_ipynb():373] not saving jupyter notebook
+2023-09-08 10:53:51,293 INFO    MainThread:9618 [wandb_init.py:_pause_backend():418] pausing backend
+2023-09-08 10:54:43,111 INFO    MainThread:9618 [wandb_init.py:_resume_backend():423] resuming backend
+2023-09-08 10:54:43,120 INFO    MainThread:9618 [jupyter.py:save_ipynb():373] not saving jupyter notebook
+2023-09-08 10:54:43,120 INFO    MainThread:9618 [wandb_init.py:_pause_backend():418] pausing backend
+2023-09-08 10:55:36,078 INFO    MainThread:9618 [wandb_init.py:_resume_backend():423] resuming backend
+2023-09-08 10:55:36,078 INFO    MainThread:9618 [jupyter.py:save_ipynb():373] not saving jupyter notebook
+2023-09-08 10:55:36,078 INFO    MainThread:9618 [wandb_init.py:_pause_backend():418] pausing backend
+2023-09-08 10:55:41,540 WARNING MsgRouterThr:9618 [router.py:message_loop():77] message_loop has been closed
