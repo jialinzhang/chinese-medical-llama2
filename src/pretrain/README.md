@@ -39,7 +39,7 @@
 |:--|:--|:--|:--|:--|:--|
 |1K|千|1000|<->|1KB|1024B|
 |1M|百万|1000K|<->|1MB|1024KB|
-|1G|十亿|1000M|<->|1GB|1024MB|
+|1B|十亿|1000M|<->|1GB|1024MB|
 
 **训练期间踩过的坑**
 - 训练期间要监控内存和`GPU`显存占用率，防止内存不足导致训练中断，尤其在加载模型时，一般会先加载模型至内存，再拷贝至`GPU`，要及时释放内存中的模型，减少内存占用
@@ -61,7 +61,12 @@
 
 **预训练结果**
 
+|Llama layer|Lora layer|训练参数量|总参数量|占比|模型存储|
+|:--|:--|:--|:--|:--|:--|
+|embed_tokens、lm_head|q_proj、v_proj|1,002,176,512|7,494,242,304|13.4%|data/lora_adapter/q_proj_v_proj_embed_tokens_lm_head|
+
+<img src='../../pic/pretrain/q_proj_v_proj_embed_tokens_lm_head.png'>
+
 |Llama layer|Lora layer|训练参数量|总参数量|占比|训练结果|模型存储|
 |:--|:--|:--|:--|:--|:--|:--|
-|embed_tokens、lm_head|q_proj、v_proj|1,002,176,512|7,494,242,304|13.4%|<img src='../../pic/pretrain/q_proj_v_proj_embed_tokens_lm_head.png'>|data/lora_adapter/q_proj_v_proj_embed_tokens_lm_head|
 |embed_tokens、lm_head|q_proj,v_proj,k_proj,o_proj,gate_proj,down_proj,up_proj|1,017,970,688|7,494,242,304|13.58%|...|...|
