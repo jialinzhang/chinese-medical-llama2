@@ -68,5 +68,5 @@
 <img src='../../pic/pretrain/q_proj_v_proj_embed_tokens_lm_head.png'>
 
 |Llama layer|Lora layer|训练参数量|总参数量|占比|模型存储|
-|:--|:--|:--|:--|:--|:--|:--|
+|:--|:--|:--|:--|:--|:--|
 |embed_tokens、lm_head|q_proj,v_proj,k_proj,o_proj,gate_proj,down_proj,up_proj|1,017,970,688|7,494,242,304|13.58%|...|
